@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 from weakref import ref as weakref_ref
 
@@ -144,11 +146,22 @@ class MoRIIOWriter:
         if not self._deferred_tasks:
             return
 
+        _defer_timeout = int(
+            os.environ.get("VLLM_MORIIO_DEFERRED_TIMEOUT_S", "300"))
         still_deferred: list[WriteTask] = []
+        _now = time.monotonic()
         for task in self._deferred_tasks:
             if self._is_remote_ready(task):
                 self._execute_write_task(task)
+            elif (hasattr(task, '_defer_time')
+                  and (_now - task._defer_time) > _defer_timeout):
+                logger.error(
+                    "Deferred write task EXPIRED for req %s "
+                    "(transfer %s) after %ds",
+                    task.request_id, task.transfer_id, _defer_timeout)
             else:
+                if not hasattr(task, '_defer_time'):
+                    task._defer_time = _now  # type: ignore[attr-defined]
                 still_deferred.append(task)
 
         self._deferred_tasks = still_deferred
@@ -474,17 +487,28 @@ class MoRIIOWrapper:
             transfers_to_wait = self.transfer_status[:]
             self.transfer_status.clear()
 
+        _xfer_timeout = int(
+            os.environ.get("VLLM_MORIIO_TRANSFER_TIMEOUT_S", "120"))
         for status in transfers_to_wait:
-            try:
-                status.Wait()
-                if not status.Succeeded():
+            _deadline = time.monotonic() + _xfer_timeout
+            while status.InProgress():
+                if time.monotonic() > _deadline:
                     logger.error(
-                        "Transfer failed: %s, Code: %s", status.Message(), status.Code()
-                    )
-                    raise TransferError("MoRIIO transfer failed!")
-            except Exception as e:
-                logger.error("Transfer %s failed: %s", status, e)
-                raise
+                        "RDMA write timed out after %ds "
+                        "(Code=%s, Msg=%s)",
+                        _xfer_timeout, status.Code(),
+                        status.Message())
+                    break
+                time.sleep(0.001)
+            if status.Failed():
+                logger.error(
+                    "Transfer failed: %s, Code: %s",
+                    status.Message(), status.Code())
+            elif not status.Succeeded():
+                logger.error(
+                    "Transfer did not succeed "
+                    "(timeout or unknown state, Code=%s)",
+                    status.Code())
 
     def async_wait_reqid(self):
         assert self.notify_port is not None, "Notify port cannot be None"
@@ -578,18 +602,33 @@ class MoRIIOWrapper:
         req_list = req_ids if isinstance(req_ids, list) else [req_ids]
 
         sock = self.paths[path]
-        try:
-            for req_id in req_list:
-                if not isinstance(req_id, str):
-                    logger.warning(
-                        "Invalid req_id type: %s, expected str", type(req_id)
-                    )
-                    continue
-                sock.send(req_id.encode("utf-8"))
-        except Exception as e:
-            logger.error("Failed to send notification to %s: %s", path, e)
-            self.paths.pop(path, None)
-            raise
+        _MAX_RETRIES = 3
+        for req_id in req_list:
+            if not isinstance(req_id, str):
+                logger.warning(
+                    "Invalid req_id type: %s, expected str", type(req_id))
+                continue
+            for _attempt in range(_MAX_RETRIES):
+                try:
+                    sock.send(req_id.encode("utf-8"), zmq.NOBLOCK)
+                    break
+                except zmq.Again:
+                    if _attempt < _MAX_RETRIES - 1:
+                        time.sleep(0.01 * (_attempt + 1))
+                        logger.warning(
+                            "ZMQ send retry %d for req %s to %s",
+                            _attempt + 1, req_id, path)
+                    else:
+                        logger.error(
+                            "ZMQ send FAILED after %d retries "
+                            "for req %s to %s",
+                            _MAX_RETRIES, req_id, path)
+                except Exception as e:
+                    logger.error(
+                        "Failed to send notification to %s: %s",
+                        path, e)
+                    self.paths.pop(path, None)
+                    raise
 
     def pop_finished_req_ids(self):
         # producer invocation: get the set of completed requests at the decode
