@@ -284,35 +284,10 @@ class AsyncLLM(EngineClient):
         request_id: str,
         params: SamplingParams | PoolingParams,
     ) -> int | None:
-        """Pick a stable ``data_parallel_rank`` for a request.
+        """Pick a stable DP rank for disagg P/D pairs.
 
-        When the OpenAI server is run with ``--api-server-count N`` (N > 1),
-        Linux SO_REUSEPORT shuffles incoming connections across ApiServer
-        processes. Two legs of a disaggregated prefill/decode pair (which
-        share a ``request_id``) can land on different ApiServers and be
-        load-balanced to different DP ranks. KV-transfer protocols that
-        pin source/target by DP rank (MoRI-IO, NIXL WRITE-mode, ...) then
-        end up exchanging handshakes with the wrong peer and the request
-        deadlocks at the connector level.
-
-        To work around this we synthesize a per-request DP rank that both
-        legs will independently agree on, in this order:
-
-          1. ``params.extra_args["kv_transfer_params"]["dp_rank_hint"]``
-             if the caller (or an upstream routing sidecar) has already
-             picked the rank.
-          2. Otherwise a stable ``blake2s(request_id) % effective_dp_size``
-             hash.
-
-        When ``data_parallel_size_local`` is set and smaller than
-        ``data_parallel_size`` (multi-pod DP, "Wide-EP"), the modulus is
-        capped to the local pod size so that both legs route to a rank in
-        the same pod -- cross-pod handshake requires a coordinator that
-        may not exist in the disagg orchestrator.
-
-        Returns ``None`` when there is no DP fan-out to disambiguate
-        (``effective_dp_size <= 1``); callers should leave
-        ``data_parallel_rank`` unset in that case.
+        Uses dp_rank_hint from params if set, otherwise hashes request_id.
+        Returns None if dp_size <= 1.
         """
         pc = self.vllm_config.parallel_config
         try:
@@ -362,11 +337,7 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
-        # ROCm-only: stable per-request DP-rank fallback to neutralise the
-        # SO_REUSEPORT shuffle on disagg P/D pairs (MoRI-IO, NIXL WRITE).
-        # Gated to ROCm because (a) MoRI-IO is the in-tree consumer that
-        # exercises this path and (b) we don't want to silently change the
-        # default DP load-balancing behaviour for CUDA users.
+        # ROCm: auto-route disagg P/D pairs to matching DP rank.
         if current_platform.is_rocm() and data_parallel_rank is None:
             data_parallel_rank = self._pick_dp_rank_for_request(request_id, params)
             if data_parallel_rank is not None:

@@ -1140,15 +1140,7 @@ class EngineCoreProc(EngineCore):
                 numa_utils.log_current_affinity_state(process_title)
 
             if data_parallel and vllm_config.kv_transfer_config is not None:
-                # On ROCm multi-node DP deployments, ``local_dp_rank``
-                # collides across nodes (each node spawns engines
-                # 0..N-1 locally), so suffix the engine_id with the
-                # *global* ``dp_rank`` to keep engine_ids unique world-
-                # wide. On other platforms we preserve the legacy
-                # ``local_dp_rank`` suffix to keep this branch
-                # bit-identical to upstream HEAD until the equivalent
-                # fix (vllm-project/vllm#39276) merges upstream and the
-                # platform gate can be dropped.
+                # Use global dp_rank on ROCm for unique engine_ids.
                 _engine_id_dp_suffix = (
                     dp_rank if current_platform.is_rocm() else local_dp_rank
                 )
@@ -1800,15 +1792,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
-        # First-wave wake: do NOT gate on ``request_wave != self.current_wave``.
-        # Both default to 0, so that gate skips the ``start_wave`` broadcast on
-        # the very first request after engine init -- the DP rank that received
-        # it then blocks forever on the first collective (EP/MoE all2all,
-        # ``has_unfinished_dp`` all-reduce) because the other ranks see
-        # ``engines_running == False`` and never call ``execute_dummy_batch``,
-        # until the multiproc_executor 1800s timeout fires. Reproduces 100% on
-        # DeepSeek-V3 DP=8/16 cold start. Steady state stays correct: once
-        # ``engines_running`` is True the wake branch short-circuits.
+        # Wake other DP engines on first request to avoid collective hang.
         if self.has_coordinator:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
