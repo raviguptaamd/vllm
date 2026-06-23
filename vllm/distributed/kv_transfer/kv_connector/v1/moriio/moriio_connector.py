@@ -539,8 +539,19 @@ class MoRIIOConnectorScheduler:
             )
             self.paths[path] = sock
 
+        # Align with the upstream READ-mode release (see _pop_done_transfers):
+        # advertise the consumer (decode) TP size so the prefill side counts
+        # the right number of ACKs via get_moriio_expected_ack_count(). For the
+        # homogeneous-TP configs we run (1P1D/2P2D, TP=1) this resolves to 1
+        # ACK exactly as before; it only matters under heterogeneous-TP fan-in.
         self.paths[path].send(
-            msgpack.dumps({"type": "release", "transfer_id": transfer_id})
+            msgpack.dumps(
+                {
+                    "type": "release",
+                    "transfer_id": transfer_id,
+                    "consumer_tp_size": self.tp_size,
+                }
+            )
         )
 
     def _release_write_prefill_blocks(self, request_id: ReqId, params: dict[str, Any]):
