@@ -536,16 +536,24 @@ class ROCMAiterMLASparseMetadataBuilder(
             self._num_attention_heads,
             clamped_seq_lens.tobytes(),
         )
-        # The persistent MLA kernel is numerically wrong for multi-token prefill
-        # batches; errors compound across chunked prefill and break long-context
-        # decode (vllm#47042). Use it only for decode and single-chunk prefills,
-        # not chunked-prefill continuations (>1 query token, seq_len > query_len).
-        step_query_lens = seg_lengths
-        total_seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs].numpy()
+        # The persistent (work-stealing) split-KV MLA kernel is numerically
+        # wrong for multi-token prefill batches; the error compounds across
+        # chunked prefill and breaks long-context decode (vllm#47042). Decode is
+        # always single-token for this backend (UNIFORM_SINGLE_TOKEN_DECODE, no
+        # spec-as-decode), so keep the persistent path for decode and fresh
+        # single-chunk prefills and fall back to the correct non-persistent
+        # split-KV path only for chunked-prefill continuations (>1 query token
+        # this step with prior context, i.e. seq_len > query_len). Slice to
+        # num_reqs and use int64 so the masks cannot broadcast-mismatch under
+        # cudagraph padding.
+        step_query_lens = seg_lengths[:num_reqs].astype(np.int64)
+        total_seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs].numpy().astype(
+            np.int64
+        )
         is_chunked_continuation = (step_query_lens > 1) & (
             total_seq_lens > step_query_lens
         )
-        use_persistent = not is_chunked_continuation.any()
+        use_persistent = not bool(is_chunked_continuation.any())
         if use_persistent and metadata_key != self._prev_metadata_key:
             from aiter import get_mla_metadata_v1
 
