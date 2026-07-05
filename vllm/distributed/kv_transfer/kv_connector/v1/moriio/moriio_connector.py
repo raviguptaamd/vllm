@@ -1563,7 +1563,10 @@ class MoRIIOConnectorWorker:
             cache_list = [cache_or_caches] if use_mla else cache_or_caches
             for cache in cache_list:
                 base_addr = cache.data_ptr()
-                region_len = self.num_blocks * self.block_len
+                # DSA dual-KV fix: size each region by its OWN tensor, not the
+                # global self.block_len (the DSA indexer cache has a different
+                # latent dim than the main MLA cache).
+                region_len = cache.nelement() * cache.element_size()
                 caches_data.append((base_addr, region_len, cache.device.index, ""))
                 kv_caches_base_addr.append(base_addr)
 
@@ -1576,7 +1579,7 @@ class MoRIIOConnectorWorker:
                 moriio_mem_metadata
             )
 
-            self.local_kv_cache_size.append(cache.nelement() * cache.element_size())
+            self.local_kv_cache_size.append(kv_cache.nelement() * kv_cache.element_size())
 
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
         self.num_regions = len(caches_data)
@@ -1998,16 +2001,19 @@ class MoRIIOConnectorWorker:
         Returns:
             Tuple of (local_offsets, remote_offsets, transfer_sizes)
         """
-        assert self.kv_cache_shape is not None, "KV caches shape not initialized"
-        is_mla = len(self.kv_cache_shape) == 3
+        # DSA dual-KV fix: use the PER-LAYER tensor shape, not the global
+        # self.kv_cache_shape (the DSA indexer cache differs from the main MLA).
+        _layer_shape = tuple(self.kv_caches[layer_name].shape)
+        assert len(_layer_shape) > 0, "KV caches shape not initialized"
+        is_mla = len(_layer_shape) == 3
         stride = self.kv_caches[layer_name].stride()
         sz = self.kv_caches[layer_name].element_size()
         if is_mla:
-            blknum, blksize, hs = self.kv_cache_shape
+            blknum, blksize, hs = _layer_shape
             hn = 1
             block_stride = stride[0]
         else:
-            _, blknum, blksize, hn, hs = self.kv_cache_shape
+            _, blknum, blksize, hn, hs = _layer_shape
             local_ktov_stride = stride[0]
             block_stride = stride[1]
             remote_ktov_stride = block_stride * remote_moriio_meta.num_blocks
@@ -2056,14 +2062,15 @@ class MoRIIOConnectorWorker:
         dp0_engine_id = self.get_engine_name_with_dp(dst_engine_id, 0)
         sessions, remote_moriio_meta = self._get_built_session(dp0_engine_id)
 
-        first_layer = list(self.layer_name_to_local_kv_cache_metadata.keys())[0]
-        offs = self._compute_block_transfer_offsets(
-            first_layer, local_block_ids, remote_block_ids, remote_moriio_meta
-        )
-
+        # DSA dual-KV fix: compute offsets PER LAYER (the DSA indexer cache has a
+        # different per-block size than the main MLA cache, so a single offs reused
+        # across all layers mis-sizes the indexer transfer -> lost completion notify).
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
             sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
                 layer_name
+            )
+            offs = self._compute_block_transfer_offsets(
+                layer_name, local_block_ids, remote_block_ids, remote_moriio_meta
             )
             # TODO : apply multi-session batch-read when moriio support it
             transfer_status = self.moriio_wrapper.read_remote_data(

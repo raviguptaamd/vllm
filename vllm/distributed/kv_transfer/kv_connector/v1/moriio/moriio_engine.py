@@ -279,21 +279,33 @@ class MoRIIOWriter:
         Returns:
             The transfer plan
         """
-        # Compute offsets if not cached
-        if request_info.transfer_offset is None:
+        # DSA dual-KV fix: cache offsets PER LAYER, not once per request. GLM-5.1 has
+        # two cache geometries (main MLA dim 576 + DSA indexer dim 132); a single
+        # cached offset reused across all 156 layers mis-sizes the indexer writes and
+        # the completion never reconciles. Per-layer caching is identical for
+        # single-geometry models (DeepSeek/Hunyuan).
+        _off_by_layer = getattr(request_info, "_transfer_offset_by_layer", None)
+        if _off_by_layer is None:
+            _off_by_layer = {}
+            request_info._transfer_offset_by_layer = _off_by_layer
+        offsets = _off_by_layer.get(task.layer_name)
+        if offsets is None:
             offsets = self.worker._compute_block_transfer_offsets(
                 task.layer_name,
                 task.local_block_ids,
                 request_info.block_ids,
                 remote_moriio_meta,
             )
-            request_info.transfer_offset = offsets
+            _off_by_layer[task.layer_name] = offsets
+            # keep the legacy single-slot populated (first layer) for any external reader
+            if request_info.transfer_offset is None:
+                request_info.transfer_offset = offsets
 
         # Get session index
         layer_names = list(self.worker.layer_name_to_local_kv_cache_metadata.keys())
         sess_idx = layer_names.index(task.layer_name)
 
-        local_off, remote_off, sizes = request_info.transfer_offset
+        local_off, remote_off, sizes = offsets
 
         return LayerTransferPlan(
             request_id=task.request_id,
