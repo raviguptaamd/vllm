@@ -1556,6 +1556,30 @@ class MoRIIOConnectorWorker:
 
         self.dst_num_blocks[self.engine_id] = self.num_blocks
         self.kv_caches = kv_caches  # layer name to kv cache
+        # DSA Bug B fix: pair each main-attention KV cache to its DSA indexer
+        # k_cache by layer index, so the producer can transfer the indexer cache
+        # alongside the main one (the indexer never calls save_kv_layer itself).
+        # The '.indexer.' substring is the proven discriminator (job 37615: 78/156).
+        import re as _glm_re
+        _glm_idx_by_lnum = {}
+        for _k in kv_caches:
+            if ".indexer." not in _k:
+                continue
+            _m = _glm_re.search(r"layers\.(\d+)\.", _k)
+            if _m:
+                _glm_idx_by_lnum[_m.group(1)] = _k
+        self._glm_main_to_indexer = {}
+        for _k in kv_caches:
+            if ".indexer." in _k:
+                continue
+            _m = _glm_re.search(r"layers\.(\d+)\.", _k)
+            if _m and _m.group(1) in _glm_idx_by_lnum:
+                self._glm_main_to_indexer[_k] = _glm_idx_by_lnum[_m.group(1)]
+        if self._glm_main_to_indexer:
+            logger.info(
+                "[moriio] DSA indexer transfer enabled: paired %d main->indexer layers",
+                len(self._glm_main_to_indexer),
+            )
         kv_caches_base_addr = []
         caches_data = []
 
@@ -1584,6 +1608,21 @@ class MoRIIOConnectorWorker:
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
         self.num_regions = len(caches_data)
         self.num_layers = len(self.kv_caches.keys())
+        # DSA dual-KV fix: the producer completion gate must count only layers that
+        # actually transfer via save_kv_layer. GLM-5.1 registers 2 caches/layer (main
+        # MLA + DSA indexer), but only the main-MLA caches go through save_kv_layer; the
+        # '.indexer.' caches are registered yet never written. Gating on len(kv_caches)
+        # would never be reached. Exclude indexer caches; fall back to num_layers for
+        # single-geometry models (DeepSeek/Hunyuan have no indexer -> identical).
+        # DSA Bug B fix: the indexer caches now DO transfer (see _write_blocks_for_req
+        # + _glm_main_to_indexer), so the completion gate must count all layers again.
+        # This overrides the earlier exclude-indexer gate, whose "decode recomputes
+        # indexer" premise was false and left the decode indexer cache cold.
+        self.num_transfer_layers = self.num_layers
+        logger.info(
+            "[moriio] completion gate: num_transfer_layers=%d (num_layers=%d)",
+            self.num_transfer_layers, self.num_layers,
+        )
 
         # Optimization for models with local attention (Llama 4)
         if self.vllm_config.model_config.hf_config.model_type == "llama4":
@@ -1911,6 +1950,25 @@ class MoRIIOConnectorWorker:
             remote_notify_port=meta.remote_notify_port,
             remote_ip=meta.remote_host,
         )
+        # DSA Bug B fix: transfer the paired DSA indexer k_cache too. It is
+        # registered but never goes through save_kv_layer (its module forward() is a
+        # no-op; the write happens inside the fused SparseAttnIndexer op), so without
+        # this the decode pod selects top-k over a COLD indexer cache -> long-context
+        # collapse. Same block_ids / block pool as the main MLA layer; the per-layer
+        # indexer geometry is handled by _compute_block_transfer_offsets (dual-KV fix).
+        _glm_idx_name = getattr(self, "_glm_main_to_indexer", {}).get(layer_name)
+        if _glm_idx_name is not None:
+            self.schedule_write_blocks(
+                request_id=req_id,
+                transfer_id=meta.transfer_id,
+                dst_engine_id=meta.remote_engine_id,
+                local_block_ids=meta.local_block_ids,
+                remote_block_ids=meta.remote_block_ids,
+                layer_name=_glm_idx_name,
+                kv_layer=self.kv_caches[_glm_idx_name],
+                remote_notify_port=meta.remote_notify_port,
+                remote_ip=meta.remote_host,
+            )
 
     def merge_contiguous_blocks(
         self,
