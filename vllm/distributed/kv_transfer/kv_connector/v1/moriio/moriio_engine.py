@@ -352,7 +352,9 @@ class MoRIIOWriter:
         """
         request_info.writes_done += 1
 
-        if request_info.writes_done >= self.worker.num_layers:
+        if request_info.writes_done >= getattr(
+            self.worker, "num_transfer_layers", self.worker.num_layers
+        ):
             # Wait for transfer to complete
             self.worker.moriio_wrapper.waiting_for_transfer_complete()
 
