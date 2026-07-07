@@ -544,13 +544,26 @@ class ROCMAiterMLASparseMetadataBuilder(
         # context lengths (both clamped to topk_tokens, past which per-token KV
         # length saturates) and num_heads; fingerprint those CPU-side and skip
         # the launch when nothing changed.
+        #
+        # vllm#47766: keying on min(seq_lens, topk) ALONE collides a first prefill
+        # chunk (context ramps 1->topk) with a continuation chunk (uniform at topk),
+        # so a >=3-chunk prefill reuses the first chunk's work partition and corrupts
+        # output (compounds across layers -> long-context collapse, vllm#47042). Add
+        # clamped per-request context length + per-request query lengths to the key.
+        #
+        # DISAGG HARDENING (ours): under cudagraph/DP dummy-batch padding, seg_lengths
+        # (= np.diff(query_start_loc_cpu)) has length num_reqs_PADDED, while
+        # seq_lens_cpu[:num_reqs] has length num_reqs. Subtracting/keying them raw
+        # broadcast-mismatches on any DP rank where padded != real (numpy ValueError;
+        # that rank dies, peers see only a gloo reset). Slice seg_lengths[:num_reqs].
         num_reqs = common_attn_metadata.num_reqs
+        _seg_lengths_nr = seg_lengths[:num_reqs]
         clamped_seq_lens = np.minimum(
             common_attn_metadata.seq_lens_cpu[:num_reqs].numpy(),
             self.topk_tokens,
         )
         clamped_context_lens = np.minimum(
-            common_attn_metadata.seq_lens_cpu[:num_reqs].numpy() - seg_lengths,
+            common_attn_metadata.seq_lens_cpu[:num_reqs].numpy() - _seg_lengths_nr,
             self.topk_tokens,
         )
         metadata_key = (
@@ -559,7 +572,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             self._num_attention_heads,
             clamped_seq_lens.tobytes(),
             clamped_context_lens.tobytes(),
-            seg_lengths.tobytes(),
+            _seg_lengths_nr.tobytes(),
         )
         if metadata_key != self._prev_metadata_key:
             from aiter import get_mla_metadata_v1
