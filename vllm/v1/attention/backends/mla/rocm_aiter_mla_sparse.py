@@ -333,6 +333,14 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
     block_size: int = 1
     topk_tokens: int = 2048
 
+    # Number of decode tokens in the batch. Consumed only on the PCP (prefill
+    # context-parallel) path in maybe_gather_mla_latent_cache_inputs(); for the
+    # non-PCP disagg WideEP path it is never read, so 0 is a safe default and adds
+    # no compute. Declared to match the other sparse-MLA backends
+    # (flashmla_sparse / flashattn_mla_sparse), whose metadata carry the same field;
+    # the base mla_attention.unified_mla_kv_cache_update accesses it unconditionally.
+    num_decode_tokens: int = 0
+
     # Persistent MLA metadata (only populated when persistent mode is enabled,
     # i.e. when the aiter sparse decode kernel supports work-stealing splits).
     work_meta_data: torch.Tensor | None = None
