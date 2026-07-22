@@ -744,24 +744,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        assert (
-            attn_metadata.num_decodes is not None
-            and attn_metadata.num_prefills is not None
-            and attn_metadata.num_decode_tokens is not None
-        )
-        num_mqa_tokens = attn_metadata.num_decode_tokens
-        num_mha_tokens = q.size(0) - num_mqa_tokens
-
-        if self.impl.is_sparse and num_mha_tokens > 0:
-            prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
-            use_mha = (
-                self.prefill_backend is not None
-                and prefill_max_seq_len <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
-                and not self._vllm_config.attention_config.sparse_mla_force_mqa
+        # GLM-5.1 DSA sparse-MLA path: the sparse metadata does not carry the
+        # decode/prefill split fields (num_decodes / num_prefills /
+        # num_decode_tokens) — the sparse kernel treats the whole batch as MQA
+        # (decode-style) attention. Only the non-sparse (regular MLA) path needs
+        # the split, so gate the assert/split on impl type. (The base's 7/21
+        # revision dropped this guard and asserted unconditionally, which broke
+        # DSA; this restores the sparse special-case on top of Shiksha's base.)
+        if self.impl.is_sparse:
+            num_mqa_tokens = q.size(0)
+            num_mha_tokens = 0
+        else:
+            assert (
+                attn_metadata.num_decodes is not None
+                and attn_metadata.num_prefills is not None
+                and attn_metadata.num_decode_tokens is not None
             )
-            if not use_mha:
-                num_mqa_tokens = q.size(0)
-                num_mha_tokens = 0
+            num_mqa_tokens = attn_metadata.num_decode_tokens
+            num_mha_tokens = q.size(0) - num_mqa_tokens
 
         mha_use_quant_output = (
             quant_key is not None
