@@ -299,8 +299,12 @@ class MoRIIOConfig:
         kv_transfer_config = vllm_config.kv_transfer_config
         extra_config = kv_transfer_config.kv_connector_extra_config
         tp_rank = get_tensor_model_parallel_rank()
-        # Fold the global data_parallel_rank back to [0, dp_size_local) for
-        # per-node port allocation (handles the external-DP sentinel).
+        # per-node port allocation. data_parallel_size_local == 0 is the
+        # documented external-DP sentinel (local size unknown here); the
+        # fold_local_rank helper returns the rank unchanged in that case
+        # (a global DP rank is always < the global DP size, so no folding is
+        # needed). Do NOT assert -- it is stripped under `python -O` and would
+        # crash valid external-DP deployments.
         pc = vllm_config.parallel_config
         dp_rank = fold_local_rank(pc.data_parallel_rank, pc.data_parallel_size_local)
         base_notify_port = int(extra_config["notify_port"])
