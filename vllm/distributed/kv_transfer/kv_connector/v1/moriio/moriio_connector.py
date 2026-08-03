@@ -20,6 +20,7 @@ import zmq
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    SupportsHMA,
     KVConnectorMetadata,
     KVConnectorRole,
 )
@@ -189,7 +190,7 @@ def resolve_moriio_transfer_ack(
     return transfer_id
 
 
-class MoRIIOConnector(KVConnectorBase_V1):
+class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -265,6 +266,20 @@ class MoRIIOConnector(KVConnectorBase_V1):
     ) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        # k3-kda/HMA: hybrid models pass one block-id list per kv-cache
+        # group (attention + mamba). Flatten to the single-group list
+        # the MoRIIO scheduler expects and delegate.
+        flat: list[int] = []
+        for grp in block_ids:
+            flat.extend(grp)
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, flat)
 
     def request_finished(
         self,
@@ -1741,9 +1756,15 @@ class MoRIIOConnectorWorker:
         kv_caches_base_addr = []
         caches_data = []
 
+        from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpec  # k3-kda
         for layer_name in kv_caches:
             geometry = self._get_layer_transfer_geometry(layer_name)
-            if geometry.block_size != self.block_size:
+            # k3-kda: mamba layers use block_size=1 (indivisible state
+            # page), not the attention block_size; skip the guard.
+            _k3_is_mamba = isinstance(
+                self.layer_to_spec.get(layer_name), _K3MambaSpec
+            )
+            if not _k3_is_mamba and geometry.block_size != self.block_size:
                 raise ValueError(
                     "MoRIIO KV cache block size mismatch for layer "
                     f"{layer_name}: {geometry.block_size} != {self.block_size}"

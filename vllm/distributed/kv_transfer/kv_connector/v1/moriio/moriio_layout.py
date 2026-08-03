@@ -6,6 +6,10 @@ from typing import NamedTuple
 
 import torch
 
+from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpec  # k3-kda
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (  # k3-kda
+    derive_mamba_conv_split as _k3_derive_split,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -253,6 +257,24 @@ def get_layer_transfer_geometry(
             split_kv_regions=False,
         )
 
+    # k3-kda: MambaSpec (KDA / GDN gated-delta-net) hybrid-state layer.
+    if isinstance(spec, _K3MambaSpec):
+        _split = _k3_derive_split(spec, local_tp=1)
+        _conv_bytes, _ssm_bytes = _split.ssm_sizes
+        _page = int(_conv_bytes + _ssm_bytes)
+        _num_blocks = int(shape[0])
+        return LayerTransferGeometry(
+            num_blocks=_num_blocks,
+            block_size=1,
+            block_len=_page,
+            slot_size_bytes=_page,
+            block_stride=(stride[0] if len(stride) > 0 else _page // element_size),
+            local_kv_stride=None,
+            remote_kv_stride=None,
+            transfers_per_block=1,
+            regions_per_block=1,
+            split_kv_regions=False,
+        )
     cache_kind = "MLA" if is_mla_cache else "K/V"
     raise ValueError(
         f"Unsupported MoRIIO {cache_kind} cache shape for layer "
@@ -301,6 +323,58 @@ def merge_contiguous_offsets(
     )
 
 
+def compute_mamba_block_transfer_offsets(
+    layer_name,
+    kv_cache,
+    spec,
+    local_block_ids,
+    remote_block_ids,
+    remote_num_blocks,
+    merge_fn,
+):
+    """k3-kda: byte offsets for a mamba (KDA/GDN) layer's conv+ssm sub-regions.
+
+    Emits, per (local_block, remote_block) pair, one transfer per sub-region:
+    conv sub-projections [Q,K,V] then the ssm/recurrent state. Homogeneous TP
+    only (P_TP == D_TP); tp_ratio == 1 so remote offsets == local offsets.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+        derive_mamba_conv_split,
+    )
+
+    if len(local_block_ids) > len(remote_block_ids):
+        raise ValueError(
+            "local_block_ids longer than remote_block_ids (mamba): "
+            f"{len(local_block_ids)} > {len(remote_block_ids)}"
+        )
+
+    split = derive_mamba_conv_split(spec, local_tp=1)
+    conv_bytes, ssm_bytes = split.ssm_sizes
+    page = int(conv_bytes + ssm_bytes)
+    # Sub-regions within one page: conv sub-projections, then ssm.
+    subregions = list(split.local_conv_offsets)  # [(off,size), ...] for Q,K,V
+    subregions.append((int(conv_bytes), int(ssm_bytes)))  # ssm follows conv
+
+    # Byte stride between blocks = full page (state blocks are indivisible; one
+    # logical block == one physical page for mamba).
+    stride = page
+
+    n = len(local_block_ids) * len(subregions)
+    offset_local = [0] * n
+    offset_remote = [0] * n
+    sizes = [0] * n
+    w = 0
+    for lb, rb in zip(local_block_ids, remote_block_ids):
+        lbase = lb * stride
+        rbase = rb * stride
+        for off, sz in subregions:
+            offset_local[w] = lbase + off
+            offset_remote[w] = rbase + off  # tp_ratio==1 -> same sub-offset
+            sizes[w] = sz
+            w += 1
+    return merge_fn(offset_local, offset_remote, sizes)
+
+
 def compute_block_transfer_offsets(
     layer_name: str,
     kv_cache: torch.Tensor,
@@ -312,6 +386,13 @@ def compute_block_transfer_offsets(
         [list[int], list[int], list[int]], tuple[list[int], list[int], list[int]]
     ] = merge_contiguous_offsets,
 ) -> tuple[list[int], list[int], list[int]]:
+    from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpec  # k3-kda
+    _spec = layer_to_spec[layer_name]
+    if isinstance(_spec, _K3MambaSpec):  # k3-kda: conv/ssm sub-regions
+        return compute_mamba_block_transfer_offsets(
+            layer_name, kv_cache, _spec, local_block_ids,
+            remote_block_ids, remote_num_blocks, merge_fn,
+        )
     # A shorter (or empty) local list is the READ-mode "drop the transfer, just
     # free the prefill blocks" case (full-prefix-hit / aborted-before-scheduled):
     # decode pulls fewer blocks than the prefill holds. The zip loop below pairs

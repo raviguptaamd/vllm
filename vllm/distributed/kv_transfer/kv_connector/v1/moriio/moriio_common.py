@@ -114,6 +114,7 @@ class MoRIIOAgentMetadata(
     num_blocks: int
     block_len: int
     attn_backend_name: str
+    ssm_sizes: tuple[int, int] = (0, 0)  # k3-kda: (conv_bytes, ssm_bytes)
 
 
 class RoleManager:
