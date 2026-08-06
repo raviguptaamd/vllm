@@ -591,7 +591,7 @@ class MoRIIOConnectorScheduler:
 
         remote_notify_port = int(remote_notify_port)
         for tp_index in range(self.tp_size):
-            target_port = remote_notify_port + get_port_offset(remote_dp_rank, tp_index)
+            target_port = remote_notify_port + get_port_offset(remote_dp_rank, tp_index, self.tp_size)  # k3-portoff
             self._send_transfer_release(transfer_id, remote_host, target_port)
 
     def update_state_after_alloc(
@@ -788,7 +788,7 @@ class MoRIIOConnectorScheduler:
                             _notify_host = _remote_hosts[_pod_idx]
                     for tp_index in range(self.tp_size):
                         target_port = remote_notify_port + get_port_offset(
-                            _remote_dp_rank_for_port, tp_index
+                            _remote_dp_rank_for_port, tp_index, self.tp_size  # k3-portoff
                         )
 
                         self.send_notify_block(
@@ -1218,7 +1218,7 @@ class MoRIIOConnectorWorker:
 
         self.side_channel_port: int = (
             self.moriio_config.handshake_port
-            + get_port_offset(self.dp_rank, self.tp_rank)
+            + get_port_offset(self.dp_rank, self.tp_rank, self.moriio_config.tp_size)  # k3-portoff
         )
         self.engine_id: EngineId = engine_id
 
@@ -1731,7 +1731,23 @@ class MoRIIOConnectorWorker:
             block_shape = first_kv_cache.shape[-block_rank:]
         self.num_blocks = first_geometry.num_blocks
         self.slot_size_bytes = first_geometry.slot_size_bytes
-        if first_geometry.block_size != self.block_size:
+        # k3-kda: block_size must reflect the ATTENTION layers, not mamba.
+        # For hybrid K3 the full-attention layers are MLA (excluded from the
+        # first_layer_name selector above), so first_layer_name can be a KDA
+        # mamba layer whose block_size is 1 (indivisible state page). Using
+        # that as self.block_size would then make every real attention layer
+        # (block_size 1536 after the mamba-page padding) trip the guard below.
+        # Reconcile from the first non-mamba layer's geometry instead.
+        from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpecBS  # k3-kda
+        _attn_block_size = None
+        for _ln in kv_caches:
+            if isinstance(self.layer_to_spec.get(_ln), _K3MambaSpecBS):
+                continue
+            _attn_block_size = self._get_layer_transfer_geometry(_ln).block_size
+            break
+        if _attn_block_size is None:
+            _attn_block_size = first_geometry.block_size
+        if _attn_block_size != self.block_size:
             # DeepSeek-V3 / MLA backends (e.g. FlashMLA) override the
             # configured block_size at attention-layer creation time, so
             # the KV cache tensor is laid out with a different (usually
@@ -1740,10 +1756,10 @@ class MoRIIOConnectorWorker:
             logger.info(
                 "KV cache block_size=%d differs from config block_size=%d; "
                 "using actual tensor shape (attention backend override).",
-                first_geometry.block_size,
+                _attn_block_size,
                 self.block_size,
             )
-            self.block_size = first_geometry.block_size
+            self.block_size = _attn_block_size
         # TODO(tms): self.block_len needs to be per-layer for sliding window,
         # hybrid attn, etc
         # block size in bytes
@@ -1996,6 +2012,17 @@ class MoRIIOConnectorWorker:
             return
         if self.mode == MoRIIOMode.READ:
             return
+        # k3-kda: MORIIO_SKIP_MAMBA=1 -> do NOT run the per-layer save hook for
+        # KDA/mamba layers. The per-layer save schedules an inline RDMA write
+        # (torch.cuda.Event().record on the layer's kv tensor) DURING the forward;
+        # on the mamba cache, at the very first layers (K3 layers 0-3 are KDA), this
+        # races/collides with the MoRI-EP all2all -> "Memory access fault" on all
+        # ranks before any KDA compute. Skipping the mamba save isolates that.
+        import os as _os_k3s
+        if _os_k3s.environ.get("MORIIO_SKIP_MAMBA", "0") == "1":
+            from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpecSK
+            if isinstance(self.layer_to_spec.get(layer_name), _K3MambaSpecSK):
+                return
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_save.items():

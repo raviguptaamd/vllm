@@ -1219,7 +1219,23 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
+            import os as _os_k3z
+            if _os_k3z.environ.get("K3_FWD_BREADCRUMB", "0") == "1":
+                import logging as _lg_k3z
+                _lg_k3z.getLogger(__name__).warning(
+                    "[k3-bc] zero_block_ids START ids=%s",
+                    scheduler_output.new_block_ids_to_zero)
+            if _os_k3z.environ.get("K3_FWD_BREADCRUMB", "0") == "1":
+                import torch as _t_k3z
+                _t_k3z.cuda.synchronize()  # attribute async fault to zeroing precisely
+                import logging as _lg_k3z
+                _lg_k3z.getLogger(__name__).warning("[k3-bc] zero_block_ids SYNCED-ok")
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            if _os_k3z.environ.get("K3_FWD_BREADCRUMB", "0") == "1":
+                import torch as _t_k3z
+                _t_k3z.cuda.synchronize()  # if zeroing faulted, this raises/faults HERE
+                import logging as _lg_k3z
+                _lg_k3z.getLogger(__name__).warning("[k3-bc] zero_block_ids DONE+SYNCED")
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
@@ -3900,13 +3916,24 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
+        import os as _os_k3mf
+        _k3mf = _os_k3mf.environ.get("K3_FWD_BREADCRUMB", "0") == "1"
+        if _k3mf:
+            import torch as _t_k3mf, logging as _lg_k3mf
+            _t_k3mf.cuda.synchronize()
+            _lg_k3mf.getLogger(__name__).warning("[k3-bc] _model_forward START (pre-model synced-ok)")
+        _out_k3mf = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        if _k3mf:
+            import torch as _t_k3mf, logging as _lg_k3mf
+            _t_k3mf.cuda.synchronize()
+            _lg_k3mf.getLogger(__name__).warning("[k3-bc] _model_forward DONE+SYNCED")
+        return _out_k3mf
 
     @staticmethod
     def _is_uniform_decode(

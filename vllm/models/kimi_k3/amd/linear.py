@@ -793,6 +793,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        import os as _os_k3ml
+        _k3ml = _os_k3ml.environ.get("K3_FWD_BREADCRUMB", "0") == "1"
+        if _k3ml:
+            import torch as _t_k3ml, logging as _lg_k3ml
+            _t_k3ml.cuda.synchronize()
+            _lg_k3ml.getLogger(__name__).warning(
+                "[k3-bc] model.forward START input_ids=%s inputs_embeds=%s",
+                (None if input_ids is None else tuple(input_ids.shape)),
+                (None if inputs_embeds is None else tuple(inputs_embeds.shape)))
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -803,6 +812,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        if _k3ml:
+            import torch as _t_k3ml, logging as _lg_k3ml
+            _t_k3ml.cuda.synchronize()
+            _lg_k3ml.getLogger(__name__).warning("[k3-bc] embed DONE+SYNCED")
 
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, residual
@@ -813,6 +826,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 self.layers[self.start_layer : self.end_layer],
                 start=self.start_layer,
             ):
+                if _k3ml:
+                    import torch as _t_k3ml, logging as _lg_k3ml
+                    _t_k3ml.cuda.synchronize()
+                    _lg_k3ml.getLogger(__name__).warning(
+                        "[k3-bc] layer %d START (type=%s)", layer_idx,
+                        type(getattr(layer, "self_attn", layer)).__name__)
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -847,6 +866,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
+            if _k3ml:
+                import torch as _t_k3ml, logging as _lg_k3ml
+                _t_k3ml.cuda.synchronize()
+                _lg_k3ml.getLogger(__name__).warning(
+                    "[k3-bc] attnres layer %d START (type=%s)", layer_idx,
+                    type(getattr(layer, "self_attn", layer)).__name__)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,

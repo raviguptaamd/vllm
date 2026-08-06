@@ -331,7 +331,22 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         output: torch.Tensor,
     ) -> None:
         num_tokens = hidden_states.size(0)
+        import os as _os_k3k
+        _k3k = _os_k3k.environ.get("K3_FWD_BREADCRUMB", "0") == "1"
+        if _k3k:
+            import torch as _t_k3k, logging as _lg_k3k
+            _t_k3k.cuda.synchronize()
+            _lg_k3k.getLogger(__name__).warning(
+                "[k3-bc] KDA fwd START prefix=%s hs=%s contig=%s in_proj_w=%s",
+                getattr(self, "prefix", "?"), tuple(hidden_states.shape),
+                hidden_states.is_contiguous(),
+                tuple(self.in_proj_qkvgfab.weight.shape)
+                if hasattr(self.in_proj_qkvgfab, "weight") else "?")
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        if _k3k:
+            import torch as _t_k3k, logging as _lg_k3k
+            _t_k3k.cuda.synchronize()
+            _lg_k3k.getLogger(__name__).warning("[k3-bc] KDA in_proj DONE+SYNCED")
         if self.use_full_rank_gate:
             split_sizes = [
                 3 * self.local_projection_size,
@@ -352,9 +367,29 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 dim=-1,
             )
+            if _k3k:
+                import torch as _t_k3k, logging as _lg_k3k
+                _t_k3k.cuda.synchronize()
+                _lg_k3k.getLogger(__name__).warning(
+                    "[k3-bc] KDA split DONE mixed_qkv=%s f_a=%s beta=%s",
+                    tuple(mixed_qkv.shape), tuple(f_a.shape), tuple(beta.shape))
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+            if _k3k:
+                import torch as _t_k3k, logging as _lg_k3k
+                _t_k3k.cuda.synchronize()
+                _lg_k3k.getLogger(__name__).warning("[k3-bc] KDA g_a/g_b_proj DONE")
 
-        g1 = self.f_b_proj(f_a)[0]
+        # k3-kda: f_a is a non-contiguous slice from the padded in_proj split;
+        # feeding that strided view straight into f_b_proj's GEMM faults on the
+        # small (disagg N-1 prefill) shape (the model author already flagged an
+        # "Inductor correctness issue with the row-strided G view" and worked
+        # around it with in_proj padding, which the tiny disagg batch defeats).
+        # Materialize a dense f_a before the GEMM.
+        g1 = self.f_b_proj(f_a.contiguous())[0]
+        if _k3k:
+            import torch as _t_k3k, logging as _lg_k3k
+            _t_k3k.cuda.synchronize()
+            _lg_k3k.getLogger(__name__).warning("[k3-bc] KDA f_b_proj DONE g1=%s", tuple(g1.shape))
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
 
@@ -366,6 +401,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
+        if _k3k:
+            import torch as _t_k3k, logging as _lg_k3k
+            _t_k3k.cuda.synchronize()
+            _lg_k3k.getLogger(__name__).warning(
+                "[k3-bc] KDA projections DONE -> _forward; mixed_qkv=%s g1=%s g2=%s beta=%s",
+                tuple(mixed_qkv.shape), tuple(g1.shape), tuple(g2.shape), tuple(beta.shape))
         self._forward(
             mixed_qkv=mixed_qkv,
             g1=g1,
@@ -373,8 +414,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
+        if _k3k:
+            import torch as _t_k3k, logging as _lg_k3k
+            _t_k3k.cuda.synchronize()
+            _lg_k3k.getLogger(__name__).warning("[k3-bc] KDA _forward DONE+SYNCED")
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
+        if _k3k:
+            import torch as _t_k3k, logging as _lg_k3k
+            _t_k3k.cuda.synchronize()
+            _lg_k3k.getLogger(__name__).warning("[k3-bc] KDA o_proj DONE+SYNCED")
 
     @eager_break_during_capture
     def _forward(
@@ -410,6 +459,34 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata_narrowed = attn_metadata_raw[self.prefix]
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         m = attn_metadata_narrowed
+        import os as _os_k3e
+        if _os_k3e.environ.get("K3_KDA_CONV_DEBUG", "0") == "1":
+            try:
+                import logging as _lg_k3e
+                _cs = self.kv_cache[0] if self.kv_cache is not None else None
+                _rs = self.kv_cache[1] if self.kv_cache is not None else None
+                _nsi = m.non_spec_state_indices_tensor
+                _his = m.has_initial_state
+                _lg_k3e.getLogger(__name__).warning(
+                    "[k3-kda entry] layer=%s conv_state.shape=%s recur.shape=%s "
+                    "n_prefills=%s n_decodes=%s num_actual=%s "
+                    "nsi(min/max/n)=%s/%s/%s has_init(any/sum)=%s/%s "
+                    "spec_masks=%s",
+                    getattr(self, "prefix", "?"),
+                    (tuple(_cs.shape) if _cs is not None else None),
+                    (tuple(_rs.shape) if _rs is not None else None),
+                    getattr(m, "num_prefills", None), getattr(m, "num_decodes", None),
+                    getattr(m, "num_actual_tokens", None),
+                    (int(_nsi.min()) if _nsi is not None and _nsi.numel() else None),
+                    (int(_nsi.max()) if _nsi is not None and _nsi.numel() else None),
+                    (int(_nsi.numel()) if _nsi is not None else None),
+                    (bool(_his.any()) if _his is not None else None),
+                    (int(_his.sum()) if _his is not None else None),
+                    (None if m.spec_sequence_masks is None else True),
+                )
+            except Exception as _e_k3e:
+                import logging as _lg_k3e
+                _lg_k3e.getLogger(__name__).warning("[k3-kda entry] err %s", _e_k3e)
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
@@ -529,6 +606,28 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # and produce dense Q/K/V without that extra traffic.
                 # TODO: Use packed conv once every KDA prefill backend accepts
                 # row-strided Q/K/V directly.
+                import os as _os_k3
+                if _os_k3.environ.get("K3_KDA_CONV_DEBUG", "0") == "1":
+                    try:
+                        import logging as _lg_k3
+                        _ci = non_spec_state_indices_tensor
+                        _his = has_initial_state
+                        _lg_k3.getLogger(__name__).warning(
+                            "[k3-kda conv dbg] q_conv_state.shape=%s n_state_blocks=%d "
+                            "cache_indices(min/max/n)=%s/%s/%s has_initial_state(any/sum)=%s/%s "
+                            "num_prefills=%s num_decodes=%s",
+                            tuple(q_conv_state.shape), int(q_conv_state.shape[0]),
+                            (int(_ci.min()) if _ci is not None and _ci.numel() else None),
+                            (int(_ci.max()) if _ci is not None and _ci.numel() else None),
+                            (int(_ci.numel()) if _ci is not None else None),
+                            (bool(_his.any()) if _his is not None else None),
+                            (int(_his.sum()) if _his is not None else None),
+                            getattr(m, "num_prefills", None), getattr(m, "num_decodes", None),
+                        )
+                    except Exception as _e_k3:
+                        import logging as _lg_k3
+                        _lg_k3.getLogger(__name__).warning("[k3-kda conv dbg] err %s", _e_k3)
+
                 def _prefill_conv(
                     x: torch.Tensor,
                     state: torch.Tensor,

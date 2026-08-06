@@ -47,6 +47,7 @@ def _zero_kv_blocks_kernel(
     seg_page_sizes_ptr,
     block_ids_ptr,
     n_blocks,
+    seg_nblocks_ptr,
     N_SEGS: tl.constexpr,
     MAX_CHUNKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -80,6 +81,12 @@ def _zero_kv_blocks_kernel(
     if chunk_index >= page_size_el // BLOCK_SIZE:
         return
     block_id = tl.load(block_ids_ptr + block_index)
+    # k3-kda: bounds-guard -- an out-of-range block_id would make the store
+    # address (seg_addr + block_id*page_size) land outside this segment's tensor
+    # and fault the GPU. Skip if block_id exceeds this segment's block capacity.
+    seg_nblk = tl.load(seg_nblocks_ptr + seg_index)
+    if block_id >= seg_nblk:
+        return
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     offset = (
@@ -127,10 +134,25 @@ class KVBlockZeroer:
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
+        seg_nblocks: list[int] = []  # k3-kda: per-segment logical block capacity
 
+        # k3-kda: MLAAttentionSpec subclasses FullAttentionSpec, so it passes the
+        # isinstance check below and the zeroer builds a segment for the MLA
+        # compressed-latent cache using standard-attention stride math -- which is
+        # WRONG for MLA's layout (rank-3 [num_blocks, block_size, latent], no K/V
+        # split). block_id*page_size then lands out of bounds -> GPU "Memory access
+        # fault" before the forward. On K3 the zeroing flag is on because of the
+        # mamba (KDA) layers (#35219), NOT the attention layers, and recording
+        # excludes MambaSpec -- so only attention block ids are ever zeroed. For a
+        # uniform-precision cache the attention pre-zeroing is unnecessary (attn
+        # writes before it reads), so skipping MLA here is safe and fixes the fault.
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec as _K3MLASpec
+        _os_k3skip = __import__("os").environ.get("K3_ZERO_SKIP_MLA", "1") == "1"
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
             if not isinstance(spec, FullAttentionSpec):
+                continue
+            if _os_k3skip and isinstance(spec, _K3MLASpec):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
@@ -167,10 +189,24 @@ class KVBlockZeroer:
                     if kv.stride(d) * el > block_stride_bytes
                 ]
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
+                # k3-kda: number of logical blocks this segment's tensor holds,
+                # so the kernel can bounds-check block_id (an out-of-range id ->
+                # block_id*page_size OOB write -> GPU "Memory access fault"). The
+                # segment spans the block_dim axis; its capacity is that axis'
+                # length divided by the logical/kernel ratio.
+                seg_nblk = int(kv.shape[block_dim]) // max(1, ratio)
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     seg_addrs.append(dp + off_bytes)
                     seg_page_sizes.append(cur_page_el)
+                    seg_nblocks.append(seg_nblk)
+
+        import os as _os_k3sd
+        if _os_k3sd.environ.get("K3_FWD_BREADCRUMB", "0") == "1":
+            logger.warning(
+                "[k3-bc] KVBlockZeroer segs=%d page_el=%s nblk=%s (first 6)",
+                len(seg_addrs), seg_page_sizes[:6], seg_nblocks[:6],
+            )
 
         if not seg_addrs:
             self._meta = None
@@ -187,13 +223,34 @@ class KVBlockZeroer:
             max_page_size_el // blk_size,
             blk_size,
             len(seg_addrs),
+            torch.tensor(seg_nblocks, dtype=torch.int64, device=self.device),
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
+        seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs, seg_nblocks = (
+            self._meta
+        )
+        # k3-kda: an out-of-range block_id makes the kernel write
+        # seg_addr + block_id*page_size past the segment tensor -> GPU
+        # "Memory access fault". Under K3 hybrid + 2P/2D the scheduler has been
+        # observed to emit attention block ids that exceed a segment's capacity;
+        # the kernel now skips any (block, seg) whose block_id >= seg_nblocks.
+        import os as _os_k3zb
+        if _os_k3zb.environ.get("K3_FWD_BREADCRUMB", "0") == "1":
+            try:
+                _cap = int(seg_nblocks.min())
+                _mx = max(block_ids)
+                if _mx >= _cap:
+                    logger.warning(
+                        "[k3-bc] zero_block_ids OOB-guard: max_id=%s >= min_seg_cap=%s "
+                        "(ids=%s) -> clamped by kernel",
+                        _mx, _cap, block_ids[:8],
+                    )
+            except Exception:
+                pass
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks * n_segs * max_chunks,)
@@ -202,6 +259,7 @@ class KVBlockZeroer:
             seg_page_sizes,
             idx,
             n_blocks,
+            seg_nblocks,
             N_SEGS=n_segs,
             MAX_CHUNKS=max_chunks,
             BLOCK_SIZE=blk_size,

@@ -1403,7 +1403,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
+                import os as _os_k3bc
+                _k3bc = _os_k3bc.environ.get("K3_FWD_BREADCRUMB", "0") == "1"
+                if _k3bc:
+                    import logging as _lg_k3bc
+                    _lg_k3bc.getLogger(__name__).warning(
+                        "[k3-bc] pre_forward START toks=%s",
+                        getattr(input_batch, "num_tokens", None))
                 self.kv_connector.pre_forward(scheduler_output)
+                if _k3bc:
+                    import torch as _t_k3bc
+                    _t_k3bc.cuda.synchronize()
+                    import logging as _lg_k3bc
+                    _lg_k3bc.getLogger(__name__).warning("[k3-bc] pre_forward DONE+SYNCED -> model()")
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
@@ -1415,6 +1427,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+                if _k3bc:
+                    import torch as _t_k3bc
+                    _t_k3bc.cuda.synchronize()
+                    import logging as _lg_k3bc
+                    _lg_k3bc.getLogger(__name__).warning("[k3-bc] model() DONE+SYNCED")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
