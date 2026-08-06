@@ -1552,7 +1552,12 @@ class MoRIIOConnectorWorker:
             if remote_tp_rank is None
             else int(remote_tp_rank)
         )
-        port_offset = get_port_offset(remote_dp_rank, dial_tp_rank, remote_tp_size)
+        # k3-remote-tp-fix: normalize degenerate remote_tp_size for the port math
+        # too, so prefill rank k dials decode port base+k (symmetric TP).
+        _k3_rts = remote_tp_size
+        if _k3_rts <= 1 and self.world_size > 1:
+            _k3_rts = self.world_size
+        port_offset = get_port_offset(remote_dp_rank, dial_tp_rank, _k3_rts)
         path = make_zmq_path("tcp", host, port + port_offset)
         logger.debug("handshake Querying metadata on path: %s", path)
 
@@ -1619,7 +1624,13 @@ class MoRIIOConnectorWorker:
 
     def _remote_tp_rank(self, remote_tp_size: int) -> int:
         # 0/unknown remote TP == homogeneous (avoids collapsing all ranks to 0).
-        if remote_tp_size == 0:
+        # k3-remote-tp-fix: remote_tp_size==1 from an un-advertising router ALSO
+        # collapses every prefill rank to decode tp0 (k//local = 0). For our
+        # symmetric-TP P/D, normalize any degenerate (<=1) remote size to the
+        # local world_size so rank k -> decode rank k.
+        if remote_tp_size <= 1 and self.world_size > 1:
+            remote_tp_size = self.world_size
+        elif remote_tp_size == 0:
             remote_tp_size = self.world_size
         return get_moriio_remote_tp_rank(self.tp_rank, self.world_size, remote_tp_size)
 
