@@ -339,6 +339,15 @@ class MoRIIOWriter:
         # otherwise it will cause precision issues.
         # This event is used to synchronize the kv transfer and computation tasks.
         task.event.synchronize()
+        import os as _k3dsos
+        if _k3dsos.environ.get('K3_WRITE_DEVSYNC', '') in ('1', 'true', 'on'):
+            # k3-write-fence: full-device sync so aux-stream KV inserts finish
+            # before RDMA reads local cache (event only covers one stream).
+            try:
+                import torch as _k3t
+                _k3t.cuda.synchronize()
+            except Exception:
+                pass
 
         # Update engine ID with DP rank
         task.dst_engine_id = self.worker.get_engine_name_with_dp(
@@ -492,6 +501,19 @@ class MoRIIOWriter:
         # to eliminate the need for this notification.
         # Consider including the first gen token from prefill in the notification
 
+        # k3-write-fence: ordering fence before write_done. The RDMA write and
+        # the ZMQ/TCP write_done travel different paths; sender-local RDMA
+        # completion does not guarantee the data is visible in the RECEIVER's
+        # HBM. Without a fence decode can read stale HBM (non-deterministic
+        # recall). 'delay' mode is the diagnostic; 'readback' the real fix.
+        import os as _k3wfos, time as _k3wftime
+        _k3wf = _k3wfos.environ.get('K3_WRITE_FENCE', '').lower()
+        if _k3wf in ('delay', '1', 'true', 'on'):
+            try:
+                _k3ms = float(_k3wfos.environ.get('K3_WRITE_FENCE_MS', '20'))
+            except Exception:
+                _k3ms = 20.0
+            _k3wftime.sleep(_k3ms / 1000.0)
         # Send completion notification
         self.worker.moriio_wrapper.send_notify(
             transfer_id, remote_ip, remote_port, message_type="write_done"

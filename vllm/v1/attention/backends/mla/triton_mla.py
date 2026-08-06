@@ -254,8 +254,15 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         )
         lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
-        # For batch invariance, use only 1 split to ensure deterministic reduction
-        if envs.VLLM_BATCH_INVARIANT:
+        # k3-single-split (opt-in, default OFF): K3_MLA_SINGLE_SPLIT=1 forces a
+        # single KV split so the split-KV reduction is deterministic. This was a
+        # disagg-recall diagnostic; it does NOT fix the known decode-side recall
+        # bug, so it is disabled by default and kept only as an investigation knob.
+        import os as _k3ssos
+        if _k3ssos.environ.get('K3_MLA_SINGLE_SPLIT', '0') == '1':
+            num_kv_splits = 1
+        elif envs.VLLM_BATCH_INVARIANT:
+            # For batch invariance, use only 1 split to ensure deterministic reduction
             num_kv_splits = 1
         else:
             num_kv_splits = _compute_num_kv_splits(
