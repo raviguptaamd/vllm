@@ -412,6 +412,7 @@ class MoRIIOConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
         self._reqs_need_save: dict[ReqId, tuple[Request, list[int]]] = {}
+        self._reqs_save_mamba: dict[ReqId, list[int]] = {}  # k3-mamba-blockids
         # Snapshot of kv_transfer_params for chunked prefill recovery.
         self._req_kv_params: dict[ReqId, dict] = {}
 
@@ -515,6 +516,7 @@ class MoRIIOConnectorScheduler:
         block_notify_list: list[int],
         host=None,
         port=None,
+        mamba_block_notify_list: list[int] | None = None,  # k3-mamba-blockids
     ):
         path = make_zmq_path("tcp", host, port)
         if path not in self.paths:
@@ -528,6 +530,7 @@ class MoRIIOConnectorScheduler:
             "req_id": req_id,
             "transfer_id": transfer_id,
             "block_notify_list": block_notify_list or [],
+            "mamba_block_notify_list": mamba_block_notify_list or [],  # k3-mamba-blockids
             # GLOBAL decode dp rank: producer derives the per-pod notify offset
             # (% dp_local), owning pod index (// dp_local), and write-target
             # from it. Sending the LOCAL rank made child-pod consumers look
@@ -643,7 +646,11 @@ class MoRIIOConnectorScheduler:
         request_id = request.request_id
         self.map_request_id(request_id, transfer_id)
         if params.get("do_remote_decode"):
-            local_block_ids = blocks.get_block_ids()[0]
+            _k3_gbi = blocks.get_block_ids()
+            local_block_ids = _k3_gbi[0]
+            self._reqs_save_mamba[request.request_id] = (  # k3-mamba-blockids
+                list(_k3_gbi[1]) if len(_k3_gbi) > 1 else []
+            )
             self._reqs_need_save[request.request_id] = (request, local_block_ids)
             # Snapshot params now so chunked-prefill build_connector_meta
             # can recover them on the final chunk even if the live
@@ -764,8 +771,13 @@ class MoRIIOConnectorScheduler:
 
                     # num_external_tokens == 0: nothing to push, so don't tell
                     # the producer to write into these blocks.
+                    _k3_gbi_d = blocks.get_block_ids()  # k3-mamba-blockids
                     block_notify_list = (
-                        blocks.get_block_ids()[0] if num_external_tokens > 0 else []
+                        _k3_gbi_d[0] if num_external_tokens > 0 else []
+                    )
+                    mamba_block_notify_list = (
+                        (list(_k3_gbi_d[1]) if len(_k3_gbi_d) > 1 else [])
+                        if num_external_tokens > 0 else []
                     )
 
                     # Wide-EP multi-pod: a pod binds notify sockets only for
@@ -797,6 +809,7 @@ class MoRIIOConnectorScheduler:
                             block_notify_list=block_notify_list,
                             host=_notify_host,
                             port=target_port,
+                            mamba_block_notify_list=mamba_block_notify_list,  # k3-mamba-blockids
                         )
 
             # Only trigger 1 KV transfer per request.
@@ -844,6 +857,7 @@ class MoRIIOConnectorScheduler:
                             local_block_ids=self._reqs_need_pending_save[req_id][1],
                             kv_transfer_params=kv_params,
                             write_mode=True,
+                            mamba_local_block_ids=self._reqs_save_mamba.get(req_id, []),  # k3-mamba-blockids
                         )
                         del self._reqs_need_pending_save[req_id]
 
@@ -867,6 +881,7 @@ class MoRIIOConnectorScheduler:
                 local_block_ids=block_ids,
                 kv_transfer_params=kv_params,
                 write_mode=True,
+                mamba_local_block_ids=self._reqs_save_mamba.get(req_id, []),  # k3-mamba-blockids
             )
         # Clear the list once workers start the transfers
 
@@ -1308,6 +1323,7 @@ class MoRIIOConnectorWorker:
         kv_layer: torch.Tensor,
         remote_notify_port: int,
         remote_ip: str,
+        mamba_local_block_ids: list[int] | None = None,  # k3-mamba-blockids
     ) -> None:
         """Schedule a block write operation.
 
@@ -1338,6 +1354,7 @@ class MoRIIOConnectorWorker:
             dst_engine_id=dst_engine_id,
             local_block_ids=local_block_ids,
             remote_block_ids_hint=remote_block_ids,
+            mamba_local_block_ids=mamba_local_block_ids,  # k3-mamba-blockids
             layer_name=layer_name,
             event=event,
             remote_notify_port=remote_notify_port,
@@ -2395,6 +2412,7 @@ class MoRIIOConnectorWorker:
             kv_layer=kv_layer,
             remote_notify_port=meta.remote_notify_port,
             remote_ip=meta.remote_host,
+            mamba_local_block_ids=meta.mamba_local_block_ids,  # k3-mamba-blockids
         )
 
     def merge_contiguous_blocks(

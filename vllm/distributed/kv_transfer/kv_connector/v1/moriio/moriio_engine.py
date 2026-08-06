@@ -380,10 +380,24 @@ class MoRIIOWriter:
         geometry_key = _get_write_geometry_key(layer_cache)
         offsets = request_info.transfer_offsets.get(geometry_key)
         if offsets is None:
+            from vllm.v1.kv_cache_interface import MambaSpec as _K3MS_BL  # k3-mamba-blockids
+            _k3_mamba = isinstance(
+                self.worker.layer_to_spec.get(task.layer_name), _K3MS_BL
+            )
+            if _k3_mamba:
+                # k3-mamba-blockids: mamba/KDA state lives in a SEPARATE KV-cache
+                # group whose slot ids differ from the attention group's block ids.
+                # Route the mamba-layer transfer by the mamba group's ids (falling
+                # back to attention ids for non-hybrid models).
+                _k3_local = task.mamba_local_block_ids or task.local_block_ids
+                _k3_remote = request_info.mamba_block_ids or request_info.block_ids
+            else:
+                _k3_local = task.local_block_ids
+                _k3_remote = request_info.block_ids
             offsets = self.worker._compute_block_transfer_offsets(
                 task.layer_name,
-                task.local_block_ids,
-                request_info.block_ids,
+                _k3_local,
+                _k3_remote,
                 remote_moriio_meta,
             )
             request_info.transfer_offsets[geometry_key] = offsets
@@ -774,6 +788,7 @@ class MoRIIOWrapper:
         assert get_role() == ROLE.PRODUCER, "Only prefill can get block messages"
         transfer_id = data["transfer_id"]
         block_notify_list = data.get("block_notify_list", [])
+        mamba_block_notify_list = data.get("mamba_block_notify_list", [])  # k3-mamba-blockids
         decode_dp_rank = data.get("decode_rank", 0)
         if not block_notify_list:
             raise MoRIIOError(
@@ -788,7 +803,8 @@ class MoRIIOWrapper:
                 )
                 return
             self.done_remote_allocate_req_dict[transfer_id] = RemoteAllocInfo(
-                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank
+                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank,
+                mamba_block_ids=list(mamba_block_notify_list or []),  # k3-mamba-blockids
             )
 
     def _handle_write_done_message(self, data: dict):

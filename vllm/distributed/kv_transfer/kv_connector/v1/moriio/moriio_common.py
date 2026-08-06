@@ -59,6 +59,7 @@ class WriteTask:
     event: torch.cuda.Event
     remote_notify_port: int
     remote_ip: str
+    mamba_local_block_ids: list[int] | None = None  # k3-mamba-blockids
     enqueue_time: float = field(default_factory=time.perf_counter)
     retried: int = 0
 
@@ -82,6 +83,7 @@ class RemoteAllocInfo:
     """Information about remote block allocation."""
 
     block_ids: list[int]
+    mamba_block_ids: list[int] | None = None  # k3-mamba-blockids
     writes_done: int = 0
     writes_expected: int | None = None
     decode_dp_rank: int = 0
@@ -465,6 +467,8 @@ class ReqMeta:
     multi_pod_hosts: list[str] = field(default_factory=list)
     # Per-pod DP size; 0 means fallback to remote_dp_size.
     remote_dp_size_local: int = 0
+    # k3-mamba-blockids: mamba KV-group [1] local slot id(s) for this req.
+    mamba_local_block_ids: list[int] = field(default_factory=list)
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -488,6 +492,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
         write_mode=False,
+        mamba_local_block_ids: list[int] | None = None,  # k3-mamba-blockids
     ):
         """Ingest a peer's ``kv_transfer_params`` into a typed ``ReqMeta``.
 
@@ -583,6 +588,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             multi_pod_hosts=_pod_hosts,
             remote_dp_size_local=_remote_dp_size_local,
         )
+        _req.mamba_local_block_ids = list(mamba_local_block_ids or [])  # k3-mamba-blockids
         if write_mode:
             self.reqs_to_save[request_id] = _req
         else:
