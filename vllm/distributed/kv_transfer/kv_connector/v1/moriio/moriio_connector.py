@@ -407,6 +407,27 @@ class MoRIIOConnectorScheduler:
         # Global DP rank for pinned request ownership check.
         self._global_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         self.is_producer = self.kv_transfer_config.kv_role == "kv_producer"
+        # k3-mamba-n1: hybrid (mamba/KDA) detection. Kimi-K3 carries
+        # text_config.linear_attn_config.kda_layers; any linear/mamba/kda
+        # marker => the recurrent-state N-vs-N-1 boundary applies.
+        self._has_mamba = False
+        try:
+            _mc = getattr(self.vllm_config, 'model_config', None)
+            _hf = getattr(_mc, 'hf_config', None) if _mc is not None else None
+            _tc = getattr(_hf, 'text_config', None) or _hf
+            _la = getattr(_tc, 'linear_attn_config', None)
+            if _la is None and isinstance(getattr(_tc, '__dict__', None), dict):
+                _la = _tc.__dict__.get('linear_attn_config')
+            if _la:
+                self._has_mamba = True
+        except Exception:
+            self._has_mamba = False
+        # Escape hatch: K3_MAMBA_N1_FORCE=0/1 overrides the auto-detection.
+        import os as _k3n1os
+        if _k3n1os.environ.get('K3_MAMBA_N1_FORCE', '') in ('0', '1'):
+            self._has_mamba = (_k3n1os.environ['K3_MAMBA_N1_FORCE'] == '1')
+        logger.debug('[k3-mamba-n1] _has_mamba=%s (mamba N-1 boundary %s)',
+                     self._has_mamba, 'ON' if self._has_mamba else 'off')
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
@@ -479,6 +500,36 @@ class MoRIIOConnectorScheduler:
             len(self.request_id_to_transfer_id),
         )
 
+    def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
+        # k3-mamba-n1: D-side. Mamba decoder recomputes the last prompt
+        # token and must start from h(N-1), so it pulls only N-1 tokens.
+        if getattr(self, '_has_mamba', False) and num_prompt_tokens > 1:
+            return num_prompt_tokens - 1
+        return num_prompt_tokens
+
+    def _truncate_mamba_request_for_prefill(self, request: "Request") -> None:
+        # k3-mamba-n1: P-side. Drop the last prompt token so the prefiller
+        # computes h(N-1) not h(N); the decoder recomputes token N to get
+        # h(N). Guarded against repeated truncation on preempt/reschedule.
+        params = request.kv_transfer_params
+        if (
+            params is not None
+            and not params.get('_p_side_truncated')
+            and request.num_prompt_tokens > 1
+        ):
+            if request.prompt_token_ids is not None:
+                request.prompt_token_ids.pop()
+            elif getattr(request, 'prompt_embeds', None) is not None:
+                request.prompt_embeds = request.prompt_embeds[:-1]
+            else:
+                return
+            request._all_token_ids.pop()
+            request.num_prompt_tokens -= 1
+            request.max_tokens = 1
+            params['_p_side_truncated'] = True
+            logger.debug('[k3-mamba-n1] P-side truncated req %s to N-1 for mamba prefill',
+                         request.request_id)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -498,14 +549,27 @@ class MoRIIOConnectorScheduler:
             * true if the external KV cache tokens will be loaded
               asynchronously (between scheduler steps).
         """
+        # k3-mamba-n1: P-side prompt truncation for mamba runs BEFORE the
+        # producer early-return. In MoRIIO WRITE the producer is the prefill
+        # leg (do_remote_decode); drop its last prompt token so it computes
+        # h(N-1). The decoder (consumer) recomputes token N to derive h(N).
+        _k3_params = request.kv_transfer_params
+        if (
+            getattr(self, '_has_mamba', False)
+            and _k3_params is not None
+            and _k3_params.get('do_remote_decode')
+        ):
+            self._truncate_mamba_request_for_prefill(request)
         if self.is_producer:
             return 0, False
 
         token_ids = request.prompt_token_ids or []
         if self.mode == MoRIIOMode.WRITE:
-            # MoriiO in write mode, no remote prefill
-
-            return len(token_ids) - num_computed_tokens, True
+            # MoriiO in write mode, no remote prefill.
+            # k3-mamba-n1: D-side returns N-1 for mamba (decode recomputes the
+            # last prompt token from h(N-1)); non-mamba keeps N.
+            _k3_n = self._get_remote_prefill_token_count(len(token_ids))
+            return _k3_n - num_computed_tokens, True
 
         return len(token_ids) - 1 - num_computed_tokens, False
 
