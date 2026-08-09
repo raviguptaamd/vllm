@@ -1088,13 +1088,20 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
             return
         from vllm import _custom_ops as ops
 
+        # NOTE: concat_and_cache_mla is registered under the libtorch STABLE ABI
+        # (STABLE_TORCH_LIBRARY) on v0.27, whose boxed kernel dispatches POSITIONALLY
+        # only -- passing kv_cache_dtype=/scale= as kwargs raises "unknown parameter
+        # type" on the first real forward (the fake/compile path returns early, so it
+        # survives warmup then crashes on first decode). Pass positionally like every
+        # other caller (the _custom_ops wrapper + tests). Upstream v0.27 stable-ABI
+        # regression, not GLM/DSA-specific.
         ops.concat_and_cache_mla(
             kv_c_normed,
             k_pe.squeeze(1),
             kv_cache,
             slot_mapping.flatten(),
-            kv_cache_dtype=kv_cache_dtype,
-            scale=k_scale,
+            kv_cache_dtype,
+            k_scale,
         )
 
 
