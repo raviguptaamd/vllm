@@ -1210,6 +1210,25 @@ class CompilationConfig:
                     self.cudagraph_mode = CUDAGraphMode.FULL
                 self.splitting_ops = []
 
+        # The *_kv_cache_update ops carry a `str` param and, for MLA, dispatch the
+        # STABLE-ABI concat_and_cache_mla whose boxed kernel does NOT compose inside
+        # the compiled/inductor graph on v0.27 (torch 2.12) -> "RuntimeError: unknown
+        # parameter type" on the first real MLA decode forward. They MUST run as an
+        # eager boundary. Upstream only appends them when splitting_ops starts as None;
+        # when it is pre-populated (e.g. from _attention_ops) the KV-update op is left
+        # in the compiled graph. Normalize: if an attention op is split, split its
+        # paired kv_cache_update op too. No-op with inductor graph partition.
+        if not self.use_inductor_graph_partition and self.splitting_ops:
+            _kv_pairs = {
+                "vllm::unified_attention_with_output": "vllm::unified_kv_cache_update",
+                "vllm::unified_mla_attention_with_output": (
+                    "vllm::unified_mla_kv_cache_update"
+                ),
+            }
+            for _attn_op, _kv_op in _kv_pairs.items():
+                if _attn_op in self.splitting_ops and _kv_op not in self.splitting_ops:
+                    self.splitting_ops.append(_kv_op)
+
         if (
             not self.use_inductor_graph_partition
             and (self.pass_config.enable_sp or self.pass_config.fuse_gemm_comms)
