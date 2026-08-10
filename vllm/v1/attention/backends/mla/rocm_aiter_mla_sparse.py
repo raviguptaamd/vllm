@@ -90,9 +90,14 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     base = tl.load(bt_ptr, mask=valid_block, other=0)
 
-    # # If token == -1 OR block_id OOB, output 0; else base * BLOCK_SIZE + offset
+    # If token == -1 OR block_id OOB, output 0 (NOT -1): the downstream aiter
+    # mla_decode_fwd sparse kernel dereferences paged_kv_indices, so a -1 becomes
+    # kv_cache + (-1)*stride -> page-aligned GPU memory access fault. Only bites at
+    # disagg long context, where -1 padding lands inside a paged_kv_indptr range;
+    # short/standalone contexts never fault. 0 is masked by paged_kv_indptr/
+    # last_page_len, so it reads block 0 harmlessly.
     out_val = tl.where(
-        is_invalid_tok | (~valid_block), -1, base * BLOCK_SIZE + inblock_off
+        is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off
     )
     out_ptr_ij = out_ptr + seq_start + indice_id
     out_ptr_ij_mask = (seq_start + indice_id) < seq_end
