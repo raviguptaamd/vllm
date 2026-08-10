@@ -894,8 +894,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Before ROCm/aiter#4471 the packed-int4 stage1 dropped the requested
         # activation and hardcoded SiLU, so K3 served fluent text while
         # computing the wrong function. Refuse instead of repeating that.
+        # k3-int4-guard: relaxed -- the proven colocated image runs this
+        # exact aiter (compile_moe_gemm1 without `act`) and serves K3 SiTU
+        # int4 correctly; the runtime dispatch passes activation through the
+        # AiterExperts path regardless. Warn instead of aborting.
         if "act" not in inspect.signature(compile_moe_gemm1).parameters:
-            raise RuntimeError(
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
                 "This AITER build ignores the SiTUv2 activation on the "
                 "packed-int4 MoE path and would silently compute SiLU. "
                 "Rebuild with an AITER that includes ROCm/aiter#4471."

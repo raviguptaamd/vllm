@@ -60,6 +60,7 @@ class WriteTask:
     remote_notify_port: int
     remote_ip: str
     mamba_local_block_ids: list[int] | None = None  # k3-mamba-blockids
+    all_group_block_ids: list[list[int]] | None = None  # k3-group-routing
     enqueue_time: float = field(default_factory=time.perf_counter)
     retried: int = 0
 
@@ -84,6 +85,7 @@ class RemoteAllocInfo:
 
     block_ids: list[int]
     mamba_block_ids: list[int] | None = None  # k3-mamba-blockids
+    all_group_block_ids: list[list[int]] | None = None  # k3-group-routing
     writes_done: int = 0
     writes_expected: int | None = None
     decode_dp_rank: int = 0
@@ -469,6 +471,9 @@ class ReqMeta:
     remote_dp_size_local: int = 0
     # k3-mamba-blockids: mamba KV-group [1] local slot id(s) for this req.
     mamba_local_block_ids: list[int] = field(default_factory=list)
+    # k3-group-routing: ALL kv-cache-groups' local block-id lists (list of
+    # lists, indexed by group index) so each layer routes to its own group.
+    all_group_block_ids: list[list[int]] | None = None
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -493,6 +498,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         write_mode=False,
         mamba_local_block_ids: list[int] | None = None,  # k3-mamba-blockids
+        all_group_block_ids: list[list[int]] | None = None,  # k3-group-routing
     ):
         """Ingest a peer's ``kv_transfer_params`` into a typed ``ReqMeta``.
 
@@ -589,6 +595,10 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_dp_size_local=_remote_dp_size_local,
         )
         _req.mamba_local_block_ids = list(mamba_local_block_ids or [])  # k3-mamba-blockids
+        _req.all_group_block_ids = (  # k3-group-routing
+            [list(g) for g in all_group_block_ids]
+            if all_group_block_ids is not None else None
+        )
         if write_mode:
             self.reqs_to_save[request_id] = _req
         else:

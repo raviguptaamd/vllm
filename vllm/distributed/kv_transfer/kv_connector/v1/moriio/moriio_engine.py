@@ -390,14 +390,34 @@ class MoRIIOWriter:
         offsets = request_info.transfer_offsets.get(geometry_key)
         if offsets is None:
             from vllm.v1.kv_cache_interface import MambaSpec as _K3MS_BL  # k3-mamba-blockids
-            _k3_mamba = isinstance(
+            # k3-group-routing: route EVERY layer by ITS OWN kv-cache-group index.
+            # Kimi-K3 has 4 groups (0/1/2 mamba, 3 MLA); the legacy code below
+            # hardcoded [0]/[1] and sent MLA KV to mamba block ids. When all
+            # groups' block ids are carried end-to-end (K3_GROUP_ROUTING=1) use
+            # the per-layer group index; otherwise fall back to legacy behavior.
+            _k3_gr_local = getattr(task, "all_group_block_ids", None)
+            _k3_gr_remote = getattr(request_info, "all_group_block_ids", None)
+            _k3_gr_on = getattr(self.worker, "_k3_group_routing", False)
+            if (
+                _k3_gr_on
+                and _k3_gr_local is not None
+                and _k3_gr_remote is not None
+            ):
+                _k3_gi = self.worker._layer_group_idx.get(
+                    task.layer_name, self.worker._attn_group_idx
+                )
+                if _k3_gi < len(_k3_gr_local) and _k3_gi < len(_k3_gr_remote):
+                    _k3_local = _k3_gr_local[_k3_gi]
+                    _k3_remote = _k3_gr_remote[_k3_gi]
+                else:
+                    _k3_local = task.local_block_ids
+                    _k3_remote = request_info.block_ids
+            elif isinstance(
                 self.worker.layer_to_spec.get(task.layer_name), _K3MS_BL
-            )
-            if _k3_mamba:
-                # k3-mamba-blockids: mamba/KDA state lives in a SEPARATE KV-cache
-                # group whose slot ids differ from the attention group's block ids.
-                # Route the mamba-layer transfer by the mamba group's ids (falling
-                # back to attention ids for non-hybrid models).
+            ):
+                # k3-mamba-blockids (legacy 2-group fallback): mamba/KDA state
+                # lives in a SEPARATE KV-cache group whose slot ids differ from
+                # the attention group's block ids.
                 _k3_local = task.mamba_local_block_ids or task.local_block_ids
                 _k3_remote = request_info.mamba_block_ids or request_info.block_ids
             else:
@@ -811,6 +831,7 @@ class MoRIIOWrapper:
         transfer_id = data["transfer_id"]
         block_notify_list = data.get("block_notify_list", [])
         mamba_block_notify_list = data.get("mamba_block_notify_list", [])  # k3-mamba-blockids
+        all_group_block_notify = data.get("all_group_block_notify", [])  # k3-group-routing
         decode_dp_rank = data.get("decode_rank", 0)
         if not block_notify_list:
             raise MoRIIOError(
@@ -827,6 +848,10 @@ class MoRIIOWrapper:
             self.done_remote_allocate_req_dict[transfer_id] = RemoteAllocInfo(
                 block_ids=block_notify_list, decode_dp_rank=decode_dp_rank,
                 mamba_block_ids=list(mamba_block_notify_list or []),  # k3-mamba-blockids
+                all_group_block_ids=(  # k3-group-routing
+                    [list(g) for g in all_group_block_notify]
+                    if all_group_block_notify else None
+                ),
             )
 
     def _handle_write_done_message(self, data: dict):

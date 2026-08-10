@@ -190,6 +190,16 @@ def resolve_moriio_transfer_ack(
     return transfer_id
 
 
+def _k3_prefill_done(self, req_id, req):  # k3-chunk-gate
+    import os as _os
+    prog = getattr(self, '_k3_prog', None)
+    if not prog or req_id not in prog:
+        return None
+    cb, st = prog[req_id]
+    slack = int(_os.environ.get('K3_CHUNK_GATE_SLACK', '2'))
+    return (cb + st) >= (int(req.num_prompt_tokens) - slack)
+
+
 class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -434,6 +444,7 @@ class MoRIIOConnectorScheduler:
         self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
         self._reqs_need_save: dict[ReqId, tuple[Request, list[int]]] = {}
         self._reqs_save_mamba: dict[ReqId, list[int]] = {}  # k3-mamba-blockids
+        self._reqs_save_allgrp: dict[ReqId, list[list[int]]] = {}  # k3-group-routing
         # Snapshot of kv_transfer_params for chunked prefill recovery.
         self._req_kv_params: dict[ReqId, dict] = {}
 
@@ -581,6 +592,7 @@ class MoRIIOConnectorScheduler:
         host=None,
         port=None,
         mamba_block_notify_list: list[int] | None = None,  # k3-mamba-blockids
+        all_group_block_notify: list[list[int]] | None = None,  # k3-group-routing
     ):
         path = make_zmq_path("tcp", host, port)
         if path not in self.paths:
@@ -595,6 +607,7 @@ class MoRIIOConnectorScheduler:
             "transfer_id": transfer_id,
             "block_notify_list": block_notify_list or [],
             "mamba_block_notify_list": mamba_block_notify_list or [],  # k3-mamba-blockids
+            "all_group_block_notify": all_group_block_notify or [],  # k3-group-routing
             # GLOBAL decode dp rank: producer derives the per-pod notify offset
             # (% dp_local), owning pod index (// dp_local), and write-target
             # from it. Sending the LOCAL rank made child-pod consumers look
@@ -715,6 +728,9 @@ class MoRIIOConnectorScheduler:
             self._reqs_save_mamba[request.request_id] = (  # k3-mamba-blockids
                 list(_k3_gbi[1]) if len(_k3_gbi) > 1 else []
             )
+            self._reqs_save_allgrp[request.request_id] = [  # k3-group-routing
+                list(g) for g in _k3_gbi
+            ]
             self._reqs_need_save[request.request_id] = (request, local_block_ids)
             # Snapshot params now so chunked-prefill build_connector_meta
             # can recover them on the final chunk even if the live
@@ -843,6 +859,10 @@ class MoRIIOConnectorScheduler:
                         (list(_k3_gbi_d[1]) if len(_k3_gbi_d) > 1 else [])
                         if num_external_tokens > 0 else []
                     )
+                    all_group_block_notify = (  # k3-group-routing
+                        [list(g) for g in _k3_gbi_d]
+                        if num_external_tokens > 0 else []
+                    )
 
                     # Wide-EP multi-pod: a pod binds notify sockets only for
                     # its LOCAL ranks, so the port offset must use the per-pod
@@ -858,10 +878,24 @@ class MoRIIOConnectorScheduler:
                     _notify_host = remote_host
                     _kvp = request.kv_transfer_params or {}
                     _remote_hosts = _kvp.get("remote_hosts") or []
-                    if _dp_local > 0 and _remote_hosts:
-                        _pod_idx = pod_index(remote_dp_rank, _dp_local)
+                    # k3-podhosts: fall back to launcher pod-hosts + derived dp_local
+                    if not _remote_hosts and hasattr(self, "kv_transfer_config"):
+                        _k3n = self.kv_transfer_config.kv_connector_extra_config.get(
+                            "moriio_pod_hosts", ""
+                        )
+                        _remote_hosts = [h.strip() for h in str(_k3n).split(",") if h.strip()]
+                    _k3_dpl = _dp_local
+                    if (not _k3_dpl) and _remote_hosts and _dp_size % len(_remote_hosts) == 0:
+                        _k3_dpl = _dp_size // len(_remote_hosts)
+                    if _k3_dpl > 0 and _remote_hosts:
+                        _pod_idx = pod_index(remote_dp_rank, _k3_dpl)
                         if 0 <= _pod_idx < len(_remote_hosts):
                             _notify_host = _remote_hosts[_pod_idx]
+                        _remote_dp_rank_for_port = fold_local_rank(remote_dp_rank, _k3_dpl)
+                        logger.info(
+                            "[k3-podhosts] notify prefill rank=%d -> host=%s (dp_local=%d)",
+                            remote_dp_rank, _notify_host, _k3_dpl,
+                        )
                     for tp_index in range(self.tp_size):
                         target_port = remote_notify_port + get_port_offset(
                             _remote_dp_rank_for_port, tp_index, self.tp_size  # k3-portoff
@@ -874,6 +908,7 @@ class MoRIIOConnectorScheduler:
                             host=_notify_host,
                             port=target_port,
                             mamba_block_notify_list=mamba_block_notify_list,  # k3-mamba-blockids
+                            all_group_block_notify=all_group_block_notify,  # k3-group-routing
                         )
 
             # Only trigger 1 KV transfer per request.
@@ -888,6 +923,27 @@ class MoRIIOConnectorScheduler:
         meta.transfer_id_to_request_id = self.transfer_id_to_request_id
 
         if self.mode == MoRIIOMode.WRITE and get_role() == ROLE.PRODUCER:
+            # k3-chunk-gate: build FRESH per-step compute-progress map. Block-count
+            # gates fail when the whole prompt fits in <=1 block (bs~5760);
+            # compute progress is the only reliable final-chunk signal.
+            self._k3_prog = {}
+            try:
+                _k3_nst = scheduler_output.num_scheduled_tokens
+                for _k3_nr in getattr(scheduler_output, 'scheduled_new_reqs', []) or []:
+                    _k3_rid = getattr(_k3_nr, 'req_id', None)
+                    if _k3_rid is not None:
+                        self._k3_prog[_k3_rid] = (
+                            int(getattr(_k3_nr, 'num_computed_tokens', 0)),
+                            int(_k3_nst.get(_k3_rid, 0)),
+                        )
+                _k3_cr = scheduler_output.scheduled_cached_reqs
+                for _k3_ci, _k3_crid in enumerate(_k3_cr.req_ids):
+                    self._k3_prog[_k3_crid] = (
+                        int(_k3_cr.num_computed_tokens[_k3_ci]),
+                        int(_k3_nst.get(_k3_crid, 0)),
+                    )
+            except Exception:
+                self._k3_prog = {}
             # This is the logic for checking against chunked prefill.
             # When the last chunk is identified,
             # It places the request metadata into the saving queue.
@@ -897,6 +953,28 @@ class MoRIIOConnectorScheduler:
 
                 if new_block_ids is not None:
                     block_ids = new_block_ids[0]
+                    # k3-chunked-allgrp: accumulate ALL groups' new blocks across
+                    # chunked prefill so all_group_block_ids grows with the
+                    # request (not frozen at chunk 1). new_block_ids is a
+                    # per-group tuple.
+                    try:
+                        if req_id in getattr(self, '_reqs_save_allgrp', {}):
+                            _k3ca_cur = self._reqs_save_allgrp[req_id]
+                            _k3ca_new = []
+                            for _k3ca_gi in range(len(_k3ca_cur)):
+                                _k3ca_add = (
+                                    list(new_block_ids[_k3ca_gi])
+                                    if _k3ca_gi < len(new_block_ids) else []
+                                )
+                                _k3ca_new.append(
+                                    list(_k3ca_cur[_k3ca_gi]) + _k3ca_add
+                                )
+                            self._reqs_save_allgrp[req_id] = _k3ca_new
+                            if req_id in getattr(self, '_reqs_save_mamba', {}) and len(_k3ca_new) > 1:
+                                # keep mamba list (group 0..n-2 are mamba; group[-1] is MLA)
+                                pass
+                    except Exception:
+                        pass
                     # TODO : hybrid attn, etc
                     # A non-disagg request (no kv_transfer_params, e.g. smoke
                     # test) is never registered in _reqs_need_pending_save;
@@ -907,10 +985,20 @@ class MoRIIOConnectorScheduler:
                     req, existing_blocks = self._reqs_need_pending_save[req_id]
                     updated_blocks = list(existing_blocks) + (block_ids)
                     self._reqs_need_pending_save[req_id] = (req, updated_blocks)
-                    if (
-                        len(self._reqs_need_pending_save[req_id][1]) * self.block_size
-                        >= req.num_prompt_tokens
-                    ):
+                    _k3done2 = _k3_prefill_done(self, req_id, req)  # k3-chunk-gate
+                    if _k3done2 is None:
+                        _k3done2 = (
+                            len(self._reqs_need_pending_save[req_id][1]) * self.block_size
+                            >= req.num_prompt_tokens
+                        )
+                    if os.environ.get('K3_CHUNK_GATE_DEBUG', '0') == '1':
+                        import logging as _k3cg_lg
+                        _k3cg_lg.getLogger(__name__).warning(
+                            '[k3-chunk-gate-accum] req=%s nblk=%d npt=%d done=%s prog=%s',
+                            req_id, len(self._reqs_need_pending_save[req_id][1]),
+                            int(req.num_prompt_tokens), _k3done2,
+                            getattr(self, '_k3_prog', {}).get(req_id))
+                    if _k3done2:
                         # Final chunk: live kv_transfer_params may be cleared,
                         # so prefer the snapshot from update_state_after_alloc.
                         kv_params = self._req_kv_params.pop(
@@ -922,8 +1010,39 @@ class MoRIIOConnectorScheduler:
                             kv_transfer_params=kv_params,
                             write_mode=True,
                             mamba_local_block_ids=self._reqs_save_mamba.get(req_id, []),  # k3-mamba-blockids
+                            all_group_block_ids=self._reqs_save_allgrp.get(req_id, None),  # k3-group-routing
                         )
                         del self._reqs_need_pending_save[req_id]
+
+            # k3-chunk-gate-sweep: emit deferred reqs whose FINAL chunk added no
+            # new block (accum loop skipped them) but whose prefill is now done.
+            try:
+                for _k3sw_rid in list(self._reqs_need_pending_save.keys()):
+                    _k3sw_req, _k3sw_bl = self._reqs_need_pending_save[_k3sw_rid]
+                    _k3sw_done = _k3_prefill_done(self, _k3sw_rid, _k3sw_req)
+                    if os.environ.get('K3_CHUNK_GATE_DEBUG', '0') == '1':
+                        import logging as _k3sw_lg
+                        _k3sw_lg.getLogger(__name__).warning(
+                            '[k3-chunk-gate-sweep] req=%s nblk=%d npt=%d done=%s prog=%s',
+                            _k3sw_rid, len(_k3sw_bl), int(_k3sw_req.num_prompt_tokens),
+                            _k3sw_done, getattr(self, '_k3_prog', {}).get(_k3sw_rid))
+                    if not _k3sw_done:
+                        continue
+                    _k3sw_kv = self._req_kv_params.pop(
+                        _k3sw_rid, _k3sw_req.kv_transfer_params or {}
+                    )
+                    meta.add_new_req(
+                        request_id=_k3sw_rid,
+                        local_block_ids=self._reqs_need_pending_save[_k3sw_rid][1],
+                        kv_transfer_params=_k3sw_kv,
+                        write_mode=True,
+                        mamba_local_block_ids=self._reqs_save_mamba.get(_k3sw_rid, []),
+                        all_group_block_ids=self._reqs_save_allgrp.get(_k3sw_rid, None),
+                    )
+                    del self._reqs_need_pending_save[_k3sw_rid]
+            except Exception as _k3sw_e:
+                import logging as _k3sw_lg2
+                _k3sw_lg2.getLogger(__name__).warning('[k3-chunk-gate-sweep] err %s', _k3sw_e)
 
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
@@ -936,7 +1055,17 @@ class MoRIIOConnectorScheduler:
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
             kv_params = self._req_kv_params.get(req_id, req.kv_transfer_params or {})
-            if req.num_prompt_tokens > len(block_ids) * self.block_size:
+            # k3-chunk-gate: defer by COMPUTE progress (fresh per-step), not block count.
+            _k3done = _k3_prefill_done(self, req_id, req)
+            if _k3done is None:
+                _k3done = not (req.num_prompt_tokens > len(block_ids) * self.block_size)
+            if os.environ.get('K3_CHUNK_GATE_DEBUG', '0') == '1':
+                import logging as _k3be_lg
+                _k3be_lg.getLogger(__name__).warning(
+                    '[k3-chunk-gate-entry] req=%s nblk=%d npt=%d done=%s prog=%s',
+                    req_id, len(block_ids), int(req.num_prompt_tokens), _k3done,
+                    getattr(self, '_k3_prog', {}).get(req_id))
+            if not _k3done:
                 # not last chunk prefill
                 self._reqs_need_pending_save[req_id] = (req, block_ids)
                 continue
@@ -946,6 +1075,7 @@ class MoRIIOConnectorScheduler:
                 kv_transfer_params=kv_params,
                 write_mode=True,
                 mamba_local_block_ids=self._reqs_save_mamba.get(req_id, []),  # k3-mamba-blockids
+                all_group_block_ids=self._reqs_save_allgrp.get(req_id, None),  # k3-group-routing
             )
         # Clear the list once workers start the transfers
 
@@ -1182,6 +1312,39 @@ class MoRIIOConnectorWorker:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
+        # k3-group-routing: Kimi-K3 has 4 kv-cache groups (0/1/2 mamba, 3 MLA).
+        # Map each layer to ITS OWN group index and find the attention
+        # (non-Mamba) group so every layer routes to its own block-id list.
+        self._layer_group_idx: dict[str, int] = {}
+        self._attn_group_idx = 0
+        try:
+            from vllm.v1.kv_cache_interface import MambaSpec as _K3GR_Mamba
+            _k3gr_groups = getattr(kv_cache_config, "kv_cache_groups", []) or []
+            for _k3gr_gi, _k3gr_grp in enumerate(_k3gr_groups):
+                for _k3gr_ln in getattr(_k3gr_grp, "layer_names", []) or []:
+                    self._layer_group_idx[_k3gr_ln] = _k3gr_gi
+            for _k3gr_gi, _k3gr_grp in enumerate(_k3gr_groups):
+                _k3gr_lns = getattr(_k3gr_grp, "layer_names", []) or []
+                if _k3gr_lns and not isinstance(
+                    self.layer_to_spec.get(_k3gr_lns[0]), _K3GR_Mamba
+                ):
+                    self._attn_group_idx = _k3gr_gi
+                    break
+        except Exception:
+            self._layer_group_idx = {}
+            self._attn_group_idx = 0
+        import os as _k3gros
+        self._k3_group_routing = (
+            _k3gros.environ.get("K3_GROUP_ROUTING", "1") == "1"
+        )
+        logger.info(
+            "[k3-group-routing] enabled=%s attn_group_idx=%s n_groups=%s "
+            "sample_layer_group_idx=%s",
+            self._k3_group_routing,
+            self._attn_group_idx,
+            len(getattr(kv_cache_config, "kv_cache_groups", []) or []),
+            dict(list(self._layer_group_idx.items())[:4]),
+        )
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -1388,6 +1551,7 @@ class MoRIIOConnectorWorker:
         remote_notify_port: int,
         remote_ip: str,
         mamba_local_block_ids: list[int] | None = None,  # k3-mamba-blockids
+        all_group_block_ids: list[list[int]] | None = None,  # k3-group-routing
     ) -> None:
         """Schedule a block write operation.
 
@@ -1419,6 +1583,7 @@ class MoRIIOConnectorWorker:
             local_block_ids=local_block_ids,
             remote_block_ids_hint=remote_block_ids,
             mamba_local_block_ids=mamba_local_block_ids,  # k3-mamba-blockids
+            all_group_block_ids=all_group_block_ids,  # k3-group-routing
             layer_name=layer_name,
             event=event,
             remote_notify_port=remote_notify_port,
@@ -1713,8 +1878,50 @@ class MoRIIOConnectorWorker:
             # Wide-EP multi-pod: remote DP ranks span pods at different IPs
             # (ranks per pod = dp_local), so resolve the host per cur_dp_rank
             # below instead of using a single host for all ranks.
-            pod_hosts = list(meta.multi_pod_hosts) if meta.multi_pod_hosts else [host]
-            remote_dp_size_local = int(meta.remote_dp_size_local) or remote_dp_size
+            # k3-podhosts: fall back to the launcher-advertised peer pod-host
+            # list (kv_connector_extra_config['moriio_pod_hosts'], ordered by
+            # pod index) instead of the single master host, so prefill can reach
+            # decode ranks that live on a HEADLESS worker node (invisible to the
+            # router). meta.multi_pod_hosts is [remote_host] (a single-host DEFAULT)
+            # when the router omits remote_hosts, so we must prefer the launcher list
+            # whenever it advertises MORE pods than meta -- not only when meta is empty.
+            _k3_meta_hosts = list(meta.multi_pod_hosts) if meta.multi_pod_hosts else []
+            _k3_ph = (
+                self.kv_transfer_config.kv_connector_extra_config.get(
+                    "moriio_pod_hosts", ""
+                )
+                if hasattr(self, "kv_transfer_config")
+                else ""
+            )
+            _k3_ph = [h.strip() for h in str(_k3_ph).split(",") if h.strip()]
+            if len(_k3_ph) > len(_k3_meta_hosts):
+                pod_hosts = _k3_ph
+                logger.info(
+                    "[k3-podhosts] using launcher pod_hosts=%s (meta had %s)",
+                    pod_hosts, _k3_meta_hosts,
+                )
+            elif _k3_meta_hosts:
+                pod_hosts = _k3_meta_hosts
+            else:
+                pod_hosts = [host]
+            # k3-podhosts: remote_dp_size_local (DP ranks PER POD) drives
+            # pod_index = global_dp_rank // dp_local. The router never sends it, so
+            # meta.remote_dp_size_local defaults to remote_dp_size (the GLOBAL size)
+            # -> pod_index collapses to 0 -> every rank resolves to pod 0 (master),
+            # so rank1's KV is written to the master not the worker. Derive the true
+            # per-pod local size from len(pod_hosts): dp_local = remote_dp_size //
+            # num_pods. With 2 pods and remote_dp_size 2 -> dp_local 1 -> pod_index
+            # (1,1)=1 -> pod_hosts[1]=worker. Honor an explicit meta value if the
+            # router ever sets one (< remote_dp_size).
+            _k3_npods = max(1, len(pod_hosts))
+            if int(meta.remote_dp_size_local) and int(meta.remote_dp_size_local) < remote_dp_size:
+                remote_dp_size_local = int(meta.remote_dp_size_local)
+            elif remote_dp_size % _k3_npods == 0:
+                remote_dp_size_local = remote_dp_size // _k3_npods
+                logger.info(
+                    "[k3-podhosts] derived remote_dp_size_local=%d (dp_size=%d, pods=%d)",
+                    remote_dp_size_local, remote_dp_size, _k3_npods,
+                )
 
         def request_ready(_f: Future[Any], entry=(req_id, meta)):
             logger.info("MoRIIO handshake done for request %s", req_id)
@@ -2469,14 +2676,36 @@ class MoRIIOConnectorWorker:
         # MoRIIOEngine._finalize_if_complete (which sees only the WriteTask,
         # not ReqMeta) can pick the per-rank pod IP for the completion notify.
         # Last-writer-wins is safe: all requests share the same topology.
-        if meta.multi_pod_hosts:
-            self.multi_pod_hosts = list(meta.multi_pod_hosts)
+        # k3-podhosts: prefer launcher-advertised peer pod-hosts + derived
+        # dp_local over the single-host / global-dp_size meta defaults, so the
+        # write_done completion notify targets the right prefill pod/rank.
+        _k3_meta_ph = list(meta.multi_pod_hosts) if meta.multi_pod_hosts else []
+        _k3_lp = (
+            self.kv_transfer_config.kv_connector_extra_config.get(
+                "moriio_pod_hosts", ""
+            )
+            if hasattr(self, "kv_transfer_config")
+            else ""
+        )
+        _k3_lp = [h.strip() for h in str(_k3_lp).split(",") if h.strip()]
+        if len(_k3_lp) > len(_k3_meta_ph):
+            self.multi_pod_hosts = _k3_lp
+        elif _k3_meta_ph:
+            self.multi_pod_hosts = _k3_meta_ph
         else:
             self.multi_pod_hosts = [meta.remote_host]
-        if meta.remote_dp_size_local:
+        _k3_gdp = int(meta.remote_dp_size)
+        _k3_npods = max(1, len(self.multi_pod_hosts))
+        if 0 < int(meta.remote_dp_size_local) < _k3_gdp:
             self.remote_dp_size_local = int(meta.remote_dp_size_local)
+        elif _k3_gdp % _k3_npods == 0:
+            self.remote_dp_size_local = _k3_gdp // _k3_npods
         else:
-            self.remote_dp_size_local = int(meta.remote_dp_size)
+            self.remote_dp_size_local = _k3_gdp
+        logger.info(
+            "[k3-podhosts] write-stash multi_pod_hosts=%s remote_dp_size_local=%d",
+            self.multi_pod_hosts, self.remote_dp_size_local,
+        )
         self.schedule_write_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
@@ -2488,6 +2717,7 @@ class MoRIIOConnectorWorker:
             remote_notify_port=meta.remote_notify_port,
             remote_ip=meta.remote_host,
             mamba_local_block_ids=meta.mamba_local_block_ids,  # k3-mamba-blockids
+            all_group_block_ids=meta.all_group_block_ids,  # k3-group-routing
         )
 
     def merge_contiguous_blocks(
