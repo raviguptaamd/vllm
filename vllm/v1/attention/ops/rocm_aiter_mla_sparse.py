@@ -159,6 +159,8 @@ def _indexer_k_quant_and_cache_kernel(
     kv_cache_value_stride,
     block_size,
     num_tokens,
+    num_k_rows,
+    num_blocks,
     head_dim: tl.constexpr,
     LAYOUT: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
@@ -167,6 +169,11 @@ def _indexer_k_quant_and_cache_kernel(
     USE_UE8M0: tl.constexpr,
 ):
     tid = tl.program_id(0)
+    # Guard the source read: at decode the grid is sized to slot_mapping, which
+    # can exceed the number of key rows actually provided (MoRIIO-transferred KV
+    # / speculative padding). Reading k_ptr past num_k_rows GPU-faults.
+    if tid >= num_k_rows:
+        return
     offset = tl.arange(0, head_dim)
     if LAYOUT == "SHUFFLE":
         tile_offset = (
@@ -180,6 +187,11 @@ def _indexer_k_quant_and_cache_kernel(
     src_ptr = k_ptr + tid * head_dim
     slot_id = tl.load(slot_mapping_ptr + tid)
     if slot_id < 0:
+        return
+    # Upper-bound guard: a decode slot_id that maps to a block >= num_blocks
+    # (stale/remote position after MoRIIO KV transfer) would store past the end
+    # of the local indexer KV cache -> page-aligned GPU memory access fault.
+    if (slot_id // block_size) >= num_blocks:
         return
     # The packed KV layout makes per-block strides large
     # enough that block_id * stride can exceed 32-bit range.
@@ -236,6 +248,7 @@ def indexer_k_quant_and_cache_triton(
     head_tile_size = head_tile_size // kv_cache.element_size()
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
     grid = (num_tokens,)
+    num_k_rows = k.shape[0]
     _indexer_k_quant_and_cache_kernel[grid](
         k,
         kv_cache_value,
@@ -245,6 +258,8 @@ def indexer_k_quant_and_cache_triton(
         kv_cache_value.stride(0),
         block_size,
         num_tokens,
+        num_k_rows,
+        num_blocks,
         head_dim,
         layout,
         block_tile_size,
