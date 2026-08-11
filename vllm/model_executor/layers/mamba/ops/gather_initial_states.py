@@ -73,14 +73,19 @@ def gather_initial_states(
         indices.to(torch.int64).clamp_(0, _n_state_blocks - 1),
         torch.zeros_like(indices, dtype=torch.int64),
     )
-    if bool((indices >= _n_state_blocks).any()) or bool((indices < 0).any()):
-        import logging as _lg
-        _bad = indices[(indices >= _n_state_blocks) | (indices < 0)]
-        _lg.getLogger(__name__).warning(
-            "[k3-kda gather] clamped %d out-of-range state idx (n_blocks=%d, "
-            "sample=%s); disagg producer prefill likely mis-flagged initial state.",
-            int(_bad.numel()), _n_state_blocks, _bad[:8].tolist(),
-        )
+    import os as _k3os  # k3-kda-nosync: clamp above is sync-free + safe; the
+    # bool(...any()) diagnostic below forces a device->CPU sync EVERY call (per
+    # KDA layer, per chunk) -> O(layers*chunks) stalls that hang ctx > ~500K.
+    # Gate behind K3_KDA_GATHER_LOG=1 (default OFF); hot path never syncs.
+    if _k3os.environ.get('K3_KDA_GATHER_LOG', '0') == '1':
+        if bool((indices >= _n_state_blocks).any()) or bool((indices < 0).any()):
+            import logging as _lg
+            _bad = indices[(indices >= _n_state_blocks) | (indices < 0)]
+            _lg.getLogger(__name__).warning(
+                "[k3-kda gather] clamped %d out-of-range state idx (n_blocks=%d, "
+                "sample=%s); disagg producer prefill likely mis-flagged initial state.",
+                int(_bad.numel()), _n_state_blocks, _bad[:8].tolist(),
+            )
     indices = _safe_idx
     output = torch.empty(
         (indices.numel(), *state.shape[1:]),
