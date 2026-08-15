@@ -259,6 +259,10 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
+    VLLM_MORI_MAX_TOKENS_PER_RANK: int = 0
+    VLLM_MORI_WARP_NUM_PER_BLOCK: int = 0
+    VLLM_MORI_BLOCK_NUM: int = 0
+    VLLM_MORI_RDMA_BLOCK_NUM: int = -1
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
@@ -1871,6 +1875,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The size in MB of the buffers (NVL and RDMA) used by DeepEP
     "VLLM_DEEPEP_BUFFER_SIZE_MB": lambda: int(
         os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")
+    ),
+    # MoRI EP tuning (parity with the VLLM_DEEPEP_* knobs above; MoRI previously had
+    # none of these and hardcoded every value).
+    #
+    # VLLM_MORI_MAX_TOKENS_PER_RANK: width of the MoRI dispatch/combine buffer
+    # (max_num_inp_token_per_rank). 0 = keep the legacy behaviour of inheriting
+    # max_num_batched_tokens. That default is a SCHEDULER knob for chunked prefill
+    # (8192), so a decode instance ends up running an 8192-token-wide all2all every
+    # step, per layer -- a large fixed per-step cost that is independent of the real
+    # batch. Set this to ~max_num_seqs on decode instances to size the buffer for the
+    # work actually being done.
+    "VLLM_MORI_MAX_TOKENS_PER_RANK": lambda: int(
+        os.getenv("VLLM_MORI_MAX_TOKENS_PER_RANK", "0")
+    ),
+    # MoRI kernel launch geometry. 0 / -1 mean "keep the per-arch default".
+    "VLLM_MORI_WARP_NUM_PER_BLOCK": lambda: int(
+        os.getenv("VLLM_MORI_WARP_NUM_PER_BLOCK", "0")
+    ),
+    "VLLM_MORI_BLOCK_NUM": lambda: int(os.getenv("VLLM_MORI_BLOCK_NUM", "0")),
+    "VLLM_MORI_RDMA_BLOCK_NUM": lambda: int(
+        os.getenv("VLLM_MORI_RDMA_BLOCK_NUM", "-1")
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
