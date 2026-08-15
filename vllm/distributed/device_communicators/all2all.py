@@ -962,6 +962,24 @@ class MoriAll2AllManager(All2AllManagerBase):
                     "mori currently only support arch gfx942 and gfx950"
                 )
 
+        # Env overrides; 0 / -1 keep the per-arch defaults selected above.
+        if envs.VLLM_MORI_WARP_NUM_PER_BLOCK > 0:
+            warp_num_per_block = envs.VLLM_MORI_WARP_NUM_PER_BLOCK
+        if envs.VLLM_MORI_BLOCK_NUM > 0:
+            block_num = envs.VLLM_MORI_BLOCK_NUM
+        if envs.VLLM_MORI_RDMA_BLOCK_NUM >= 0:
+            rdma_block_num = envs.VLLM_MORI_RDMA_BLOCK_NUM
+
+        # Dispatch/combine buffer width. By default this inherits
+        # max_num_batched_tokens, which is a chunked-prefill SCHEDULER setting (default
+        # 8192) unrelated to how many tokens an EP rank actually dispatches. On a decode
+        # instance that makes every step move an 8192-token-wide buffer per layer -- a
+        # large fixed per-step cost independent of the real batch size (measured on
+        # GLM-5.1-FP8 EP8: 302ms -> 88ms TPOT, 3.4x, when sized for the real work).
+        # Set this to ~max_num_seqs on decode instances.
+        if envs.VLLM_MORI_MAX_TOKENS_PER_RANK > 0:
+            max_num_tokens_per_dp_rank = envs.VLLM_MORI_MAX_TOKENS_PER_RANK
+
         return dict(
             rank=rank,
             world_size=num_ep_ranks,
