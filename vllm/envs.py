@@ -279,6 +279,7 @@ if TYPE_CHECKING:
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_MORI_MAX_TOKENS_PER_RANK: int = 0
+    VLLM_MORI_MAX_TOTAL_RECV_TOKENS: int = 0
     VLLM_MORI_WARP_NUM_PER_BLOCK: int = 0
     VLLM_MORI_BLOCK_NUM: int = 0
     VLLM_MORI_RDMA_BLOCK_NUM: int = -1
@@ -1963,6 +1964,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # work actually being done.
     "VLLM_MORI_MAX_TOKENS_PER_RANK": lambda: int(
         os.getenv("VLLM_MORI_MAX_TOKENS_PER_RANK", "0")
+    ),
+    # MoRI receive capacity, decoupled from the send width. mori honours
+    # maxTotalRecvTokens when > 0; vLLM never plumbed it, so recv capacity was always
+    # tied to max_num_inp_token_per_rank. 0 = legacy behaviour.
+    "VLLM_MORI_MAX_TOTAL_RECV_TOKENS": lambda: int(
+        os.getenv("VLLM_MORI_MAX_TOTAL_RECV_TOKENS", "0")
     ),
     # MoRI kernel launch geometry. 0 / -1 mean "keep the per-arch default".
     "VLLM_MORI_WARP_NUM_PER_BLOCK": lambda: int(
