@@ -976,9 +976,25 @@ class MoriAll2AllManager(All2AllManagerBase):
         # instance that makes every step move an 8192-token-wide buffer per layer -- a
         # large fixed per-step cost independent of the real batch size (measured on
         # GLM-5.1-FP8 EP8: 302ms -> 88ms TPOT, 3.4x, when sized for the real work).
-        # Set this to ~max_num_seqs on decode instances.
+        #
+        # NOTE: this value must still cover vLLM's profiling/warmup dummy run, which
+        # deliberately pushes max_num_batched_tokens through the model. Shrinking it
+        # alone trips mori's device assert
+        #   "Total recv token overflow: increase maxTotalRecvTokens"
+        # because MaxNumTokensToRecvPerRank() falls back to maxNumInpTokenPerRank.
+        # Prefer VLLM_MORI_MAX_TOTAL_RECV_TOKENS (below) to keep the receive capacity
+        # large while narrowing what each step actually dispatches.
         if envs.VLLM_MORI_MAX_TOKENS_PER_RANK > 0:
             max_num_tokens_per_dp_rank = envs.VLLM_MORI_MAX_TOKENS_PER_RANK
+
+        # Receive capacity, decoupled from the send width. mori honours
+        # maxTotalRecvTokens when > 0 (dispatch_combine.hpp:
+        #   MaxNumTokensToRecvPerRank() = ceil(maxTotalRecvTokens / worldSize)
+        #                                 clamped to maxNumInpTokenPerRank)
+        # vLLM never plumbed this field, so recv capacity was always tied to the send
+        # width. Exposing it lets a decode instance keep enough headroom for the
+        # profiling dummy run / bursty routing without paying 8192-wide dispatches.
+        max_total_recv_tokens = envs.VLLM_MORI_MAX_TOTAL_RECV_TOKENS
 
         return dict(
             rank=rank,
@@ -989,6 +1005,7 @@ class MoriAll2AllManager(All2AllManagerBase):
             scale_type_size=scale_type_size,
             max_token_type_size=input_dtype.itemsize,
             max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
+            max_total_recv_tokens=max_total_recv_tokens,
             num_experts_per_rank=num_local_experts,
             num_experts_per_token=num_experts_per_token,
             warp_num_per_block=warp_num_per_block,
