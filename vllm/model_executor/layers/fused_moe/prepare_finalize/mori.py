@@ -29,6 +29,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        # Original (pre-dispatch) topk_ids, stashed in prepare() for use in
+        # finalize() -- see the comment in prepare() for why.
+        self._original_topk_ids: torch.Tensor | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -73,6 +76,18 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert not apply_router_weight_on_input, (
             "mori does not support apply_router_weight_on_input=True now."
         )
+        # combine() needs the ORIGINAL (pre-dispatch) topk_ids, not the
+        # dispatched ids that modular_kernel.py's forward() substitutes in
+        # for the expert GEMM stage. MoRI's combine kernel uses these ids
+        # (via tokenIndices) to decide which remote nodes' partial results
+        # to gather for each of THIS rank's own tokens -- the dispatched
+        # ids describe OTHER ranks' tokens that were routed here, not the
+        # original routing of this rank's own tokens, so passing them to
+        # combine() causes it to gather from the wrong nodes. Stash the
+        # original ids here; finalize() below uses this instead of the
+        # topk_ids it's given (which is also the post-dispatch value, for
+        # the same reason).
+        self._original_topk_ids = topk_ids
         scale = None
         # When defer_input_quant is True, the expert kernel handles
         # quantization internally, so skip FP8 dispatch quantization.
@@ -119,6 +134,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         result = self.mori_op.combine(
             fused_expert_output,
             None,
-            topk_ids,
+            self._original_topk_ids,
         )[0]
         output.copy_(result[:num_token])
