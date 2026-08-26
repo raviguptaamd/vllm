@@ -1496,7 +1496,7 @@ class MoRIIOConnectorWorker:
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
         # In-progress READ transfers: req_id -> {layer_name: status}.
-        self._recving_transfers: defaultdict[ReqId, dict] = defaultdict(dict)
+        self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)  # k3: per-request list (group transfer), not upstream per-layer dict
         # Values are (remote_host, remote_notify_port, transfer_id).
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
         # Monotonic-clock start times for each in-flight recv transfer.
@@ -2247,59 +2247,25 @@ class MoRIIOConnectorWorker:
         return done_sending, done_recving
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until all in-flight READs of this layer have landed.
-
-        A host-side blocking wait must not run during full-graph capture.
-        """
-        if self.is_producer or self.mode != MoRIIOMode.READ:
-            return
-
-        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            return
-
-        deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        while True:
-            with self.moriio_wrapper.lock:
-                pending = [
-                    status_by_layer[layer_name]
-                    for status_by_layer in self._recving_transfers.values()
-                    if layer_name in status_by_layer
-                ]
-
-            if not pending:
-                return
-
-            still_running = False
-            for status in pending:
-                # A failed read is dropped in _pop_done_transfers.
-                if status.Succeeded() or status.Failed():
-                    continue
-                still_running = True
-
-            if not still_running:
-                return
-
-            if time.monotonic() > deadline:
-                logger.warning(
-                    "MoRIIO READ barrier timed out for layer %s; proceeding "
-                    "(request dropped via get_finished).",
-                    layer_name,
-                )
-                return
-
-            time.sleep(0.001)
+        # k3: NO per-layer READ barrier. K3 disagg uses WRITE mode + per-request
+        # group-routed transfer; completion is handled per-request in
+        # _pop_done_transfers/get_finished. The upstream per-layer barrier (which
+        # indexes _recving_transfers as a per-layer dict) does not apply and its
+        # dict access corrupts our per-request list. Matches -v3 (proven): no-op.
+        return
 
     def _pop_done_transfers(self) -> set[str]:
         done_req_ids: set[str] = set()
         _xfer_timeout = int(os.environ.get("VLLM_MORIIO_TRANSFER_TIMEOUT_S", "120"))
         with self.moriio_wrapper.lock:
             to_remove = []
-            for req_id, status_by_layer in self._recving_transfers.items():
-                statuses = list(status_by_layer.values())
-                failed_status = next(
-                    (status for status in statuses if status.Failed()), None
-                )
-                if statuses and all(status.Succeeded() for status in statuses):
+            for req_id, status_list in self._recving_transfers.items():
+                # k3: transfer completion is per-REQUEST (group-routed), keyed by
+                # the LAST status, not per-layer all(). K3 hybrid writes KV by
+                # KV-cache group; the upstream per-layer dict never completes for
+                # our group transfer -> decode reads incomplete KV -> garbage.
+                last = status_list[-1]
+                if last.Succeeded():
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
@@ -2310,14 +2276,14 @@ class MoRIIOConnectorWorker:
                         message_fields={"consumer_tp_size": self.world_size},
                     )
                     to_remove.append(req_id)
-                elif failed_status is not None:
+                elif last.Failed():
                     logger.error(
                         "RDMA transfer failed for request %s: %s (code=%s). "
                         "Notifying prefill to free blocks; request will be "
                         "aborted by timeout.",
                         req_id,
-                        failed_status.Message(),
-                        failed_status.Code(),
+                        last.Message(),
+                        last.Code(),
                     )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
@@ -2994,7 +2960,7 @@ class MoRIIOConnectorWorker:
                 time.sleep(_backoff)
                 _backoff = min(_backoff * 2, 0.05)
             with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id][layer_name] = transfer_status
+                self._recving_transfers[request_id].append(transfer_status)  # k3: per-request list
                 self._recving_transfers_start.setdefault(request_id, time.monotonic())
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
