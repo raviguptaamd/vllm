@@ -339,6 +339,15 @@ class MoRIIOWriter:
         # otherwise it will cause precision issues.
         # This event is used to synchronize the kv transfer and computation tasks.
         task.event.synchronize()
+        import os as _k3dsos
+        if _k3dsos.environ.get('K3_WRITE_DEVSYNC', '') in ('1', 'true', 'on'):
+            # k3-write-fence: full-device sync so aux-stream KV inserts finish
+            # before RDMA reads local cache (event only covers one stream).
+            try:
+                import torch as _k3t
+                _k3t.cuda.synchronize()
+            except Exception:
+                pass
 
         # Update engine ID with DP rank
         task.dst_engine_id = self.worker.get_engine_name_with_dp(
@@ -380,10 +389,44 @@ class MoRIIOWriter:
         geometry_key = _get_write_geometry_key(layer_cache)
         offsets = request_info.transfer_offsets.get(geometry_key)
         if offsets is None:
+            from vllm.v1.kv_cache_interface import MambaSpec as _K3MS_BL  # k3-mamba-blockids
+            # k3-group-routing: route EVERY layer by ITS OWN kv-cache-group index.
+            # Kimi-K3 has 4 groups (0/1/2 mamba, 3 MLA); the legacy code below
+            # hardcoded [0]/[1] and sent MLA KV to mamba block ids. When all
+            # groups' block ids are carried end-to-end (K3_GROUP_ROUTING=1) use
+            # the per-layer group index; otherwise fall back to legacy behavior.
+            _k3_gr_local = getattr(task, "all_group_block_ids", None)
+            _k3_gr_remote = getattr(request_info, "all_group_block_ids", None)
+            _k3_gr_on = getattr(self.worker, "_k3_group_routing", False)
+            if (
+                _k3_gr_on
+                and _k3_gr_local is not None
+                and _k3_gr_remote is not None
+            ):
+                _k3_gi = self.worker._layer_group_idx.get(
+                    task.layer_name, self.worker._attn_group_idx
+                )
+                if _k3_gi < len(_k3_gr_local) and _k3_gi < len(_k3_gr_remote):
+                    _k3_local = _k3_gr_local[_k3_gi]
+                    _k3_remote = _k3_gr_remote[_k3_gi]
+                else:
+                    _k3_local = task.local_block_ids
+                    _k3_remote = request_info.block_ids
+            elif isinstance(
+                self.worker.layer_to_spec.get(task.layer_name), _K3MS_BL
+            ):
+                # k3-mamba-blockids (legacy 2-group fallback): mamba/KDA state
+                # lives in a SEPARATE KV-cache group whose slot ids differ from
+                # the attention group's block ids.
+                _k3_local = task.mamba_local_block_ids or task.local_block_ids
+                _k3_remote = request_info.mamba_block_ids or request_info.block_ids
+            else:
+                _k3_local = task.local_block_ids
+                _k3_remote = request_info.block_ids
             offsets = self.worker._compute_block_transfer_offsets(
                 task.layer_name,
-                task.local_block_ids,
-                request_info.block_ids,
+                _k3_local,
+                _k3_remote,
                 remote_moriio_meta,
             )
             request_info.transfer_offsets[geometry_key] = offsets
@@ -472,12 +515,25 @@ class MoRIIOWriter:
         if _dp_local > 0:
             _decode_dp_rank_for_port = _decode_dp_rank_for_port % _dp_local
         remote_port = remote_notify_port + get_port_offset(
-            _decode_dp_rank_for_port, self.worker.tp_rank
+            _decode_dp_rank_for_port, self.worker.tp_rank, self.worker.moriio_config.tp_size  # k3-portoff
         )
         # Consider using RDMA immediate data in decode side
         # to eliminate the need for this notification.
         # Consider including the first gen token from prefill in the notification
 
+        # k3-write-fence: ordering fence before write_done. The RDMA write and
+        # the ZMQ/TCP write_done travel different paths; sender-local RDMA
+        # completion does not guarantee the data is visible in the RECEIVER's
+        # HBM. Without a fence decode can read stale HBM (non-deterministic
+        # recall). 'delay' mode is the diagnostic; 'readback' the real fix.
+        import os as _k3wfos, time as _k3wftime
+        _k3wf = _k3wfos.environ.get('K3_WRITE_FENCE', '').lower()
+        if _k3wf in ('delay', '1', 'true', 'on'):
+            try:
+                _k3ms = float(_k3wfos.environ.get('K3_WRITE_FENCE_MS', '20'))
+            except Exception:
+                _k3ms = 20.0
+            _k3wftime.sleep(_k3ms / 1000.0)
         # Send completion notification
         self.worker.moriio_wrapper.send_notify(
             transfer_id, remote_ip, remote_port, message_type="write_done"
@@ -774,6 +830,8 @@ class MoRIIOWrapper:
         assert get_role() == ROLE.PRODUCER, "Only prefill can get block messages"
         transfer_id = data["transfer_id"]
         block_notify_list = data.get("block_notify_list", [])
+        mamba_block_notify_list = data.get("mamba_block_notify_list", [])  # k3-mamba-blockids
+        all_group_block_notify = data.get("all_group_block_notify", [])  # k3-group-routing
         decode_dp_rank = data.get("decode_rank", 0)
         if not block_notify_list:
             raise MoRIIOError(
@@ -788,7 +846,12 @@ class MoRIIOWrapper:
                 )
                 return
             self.done_remote_allocate_req_dict[transfer_id] = RemoteAllocInfo(
-                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank
+                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank,
+                mamba_block_ids=list(mamba_block_notify_list or []),  # k3-mamba-blockids
+                all_group_block_ids=(  # k3-group-routing
+                    [list(g) for g in all_group_block_notify]
+                    if all_group_block_notify else None
+                ),
             )
 
     def _handle_write_done_message(self, data: dict):

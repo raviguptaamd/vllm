@@ -59,6 +59,8 @@ class WriteTask:
     event: torch.cuda.Event
     remote_notify_port: int
     remote_ip: str
+    mamba_local_block_ids: list[int] | None = None  # k3-mamba-blockids
+    all_group_block_ids: list[list[int]] | None = None  # k3-group-routing
     enqueue_time: float = field(default_factory=time.perf_counter)
     retried: int = 0
 
@@ -82,6 +84,8 @@ class RemoteAllocInfo:
     """Information about remote block allocation."""
 
     block_ids: list[int]
+    mamba_block_ids: list[int] | None = None  # k3-mamba-blockids
+    all_group_block_ids: list[list[int]] | None = None  # k3-group-routing
     writes_done: int = 0
     writes_expected: int | None = None
     decode_dp_rank: int = 0
@@ -114,6 +118,7 @@ class MoRIIOAgentMetadata(
     num_blocks: int
     block_len: int
     attn_backend_name: str
+    ssm_sizes: tuple[int, int] = (0, 0)  # k3-kda: (conv_bytes, ssm_bytes)
 
 
 class RoleManager:
@@ -299,13 +304,17 @@ class MoRIIOConfig:
         kv_transfer_config = vllm_config.kv_transfer_config
         extra_config = kv_transfer_config.kv_connector_extra_config
         tp_rank = get_tensor_model_parallel_rank()
-        # Fold the global data_parallel_rank back to [0, dp_size_local) for
-        # per-node port allocation (handles the external-DP sentinel).
+        # per-node port allocation. data_parallel_size_local == 0 is the
+        # documented external-DP sentinel (local size unknown here); the
+        # fold_local_rank helper returns the rank unchanged in that case
+        # (a global DP rank is always < the global DP size, so no folding is
+        # needed). Do NOT assert -- it is stripped under `python -O` and would
+        # crash valid external-DP deployments.
         pc = vllm_config.parallel_config
         dp_rank = fold_local_rank(pc.data_parallel_rank, pc.data_parallel_size_local)
         base_notify_port = int(extra_config["notify_port"])
         tp_size = get_tensor_model_parallel_world_size()
-        port_offset = get_port_offset(dp_rank, tp_rank)
+        port_offset = get_port_offset(dp_rank, tp_rank, tp_size)  # k3-portoff
         backend = str(extra_config.get("backend", "rdma")).lower()
         if backend not in ("rdma", "xgmi"):
             raise ValueError(
@@ -460,6 +469,11 @@ class ReqMeta:
     multi_pod_hosts: list[str] = field(default_factory=list)
     # Per-pod DP size; 0 means fallback to remote_dp_size.
     remote_dp_size_local: int = 0
+    # k3-mamba-blockids: mamba KV-group [1] local slot id(s) for this req.
+    mamba_local_block_ids: list[int] = field(default_factory=list)
+    # k3-group-routing: ALL kv-cache-groups' local block-id lists (list of
+    # lists, indexed by group index) so each layer routes to its own group.
+    all_group_block_ids: list[list[int]] | None = None
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -483,6 +497,8 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
         write_mode=False,
+        mamba_local_block_ids: list[int] | None = None,  # k3-mamba-blockids
+        all_group_block_ids: list[list[int]] | None = None,  # k3-group-routing
     ):
         """Ingest a peer's ``kv_transfer_params`` into a typed ``ReqMeta``.
 
@@ -577,6 +593,11 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             multi_pod_hosts=_pod_hosts,
             remote_dp_size_local=_remote_dp_size_local,
+        )
+        _req.mamba_local_block_ids = list(mamba_local_block_ids or [])  # k3-mamba-blockids
+        _req.all_group_block_ids = (  # k3-group-routing
+            [list(g) for g in all_group_block_ids]
+            if all_group_block_ids is not None else None
         )
         if write_mode:
             self.reqs_to_save[request_id] = _req

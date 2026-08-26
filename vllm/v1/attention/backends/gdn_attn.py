@@ -272,6 +272,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
             num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
             num_decode_tokens = num_decodes
+            import os as _k3fpk_os  # k3-force-prefill-kda
+            if _k3fpk_os.environ.get('K3_FORCE_PREFILL_KDA', '0') == '1' and num_decodes > 0:
+                # k3-force-prefill-kda: route ALL non-spec 1-token seqs through the prefill
+                # chunk_kda kernel (with initial_state) so the disagg boundary token
+                # is bit-consistent with prefill. num_zero_len stays excluded.
+                num_prefills = non_spec_query_lens_cpu.size(0) - num_zero_len
+                num_decodes = 0
+                num_decode_tokens = 0
             num_prefill_tokens = (
                 non_spec_query_lens_cpu.sum().item() - num_decode_tokens
             )

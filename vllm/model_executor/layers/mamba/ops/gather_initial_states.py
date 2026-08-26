@@ -60,6 +60,33 @@ def gather_initial_states(
     row_size = state[0].numel()
     # Mamba pages may pad stride(0), but each state row remains dense.
     assert state[0].is_contiguous()
+    # k3-kda guard: an out-of-range state index makes the kernel form an OOB GPU
+    # address (state_ptr + idx*stride) -> "Memory access fault", even where the
+    # value load is has_initial_state-masked. Under 2P/2D disagg the producer
+    # prefill has been observed to carry indices >= state.shape[0]; clamp the
+    # *effective* index to 0 wherever has_initial_state is False (a fresh prefill
+    # has no prior state to gather anyway) and hard-clamp any stray index into
+    # range so the address stays valid. Logs once if it fires.
+    _n_state_blocks = int(state.shape[0])
+    _safe_idx = torch.where(
+        has_initial_state,
+        indices.to(torch.int64).clamp_(0, _n_state_blocks - 1),
+        torch.zeros_like(indices, dtype=torch.int64),
+    )
+    import os as _k3os  # k3-kda-nosync: clamp above is sync-free + safe; the
+    # bool(...any()) diagnostic below forces a device->CPU sync EVERY call (per
+    # KDA layer, per chunk) -> O(layers*chunks) stalls that hang ctx > ~500K.
+    # Gate behind K3_KDA_GATHER_LOG=1 (default OFF); hot path never syncs.
+    if _k3os.environ.get('K3_KDA_GATHER_LOG', '0') == '1':
+        if bool((indices >= _n_state_blocks).any()) or bool((indices < 0).any()):
+            import logging as _lg
+            _bad = indices[(indices >= _n_state_blocks) | (indices < 0)]
+            _lg.getLogger(__name__).warning(
+                "[k3-kda gather] clamped %d out-of-range state idx (n_blocks=%d, "
+                "sample=%s); disagg producer prefill likely mis-flagged initial state.",
+                int(_bad.numel()), _n_state_blocks, _bad[:8].tolist(),
+            )
+    indices = _safe_idx
     output = torch.empty(
         (indices.numel(), *state.shape[1:]),
         dtype=state.dtype,

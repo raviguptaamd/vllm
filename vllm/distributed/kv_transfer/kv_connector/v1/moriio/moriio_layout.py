@@ -6,6 +6,10 @@ from typing import NamedTuple
 
 import torch
 
+from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpec  # k3-kda
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (  # k3-kda
+    derive_mamba_conv_split as _k3_derive_split,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -253,6 +257,27 @@ def get_layer_transfer_geometry(
             split_kv_regions=False,
         )
 
+    # k3-kda: MambaSpec (KDA / GDN gated-delta-net) hybrid-state layer.
+    if isinstance(spec, _K3MambaSpec):
+        # block_len/slot MUST be the PHYSICAL (padded) page. The hybrid allocator
+        # pads the mamba page to match the attention page ("Padding mamba page
+        # size by N%"), and the cache tensor is [num_blocks, 1, 1, page_size_bytes].
+        # Using the unpadded conv+ssm size here under-registers the tensor and
+        # (via compute_mamba_block_transfer_offsets) drifts block offsets OOB.
+        _page = int(spec.page_size_bytes)
+        _num_blocks = int(shape[0])
+        return LayerTransferGeometry(
+            num_blocks=_num_blocks,
+            block_size=1,
+            block_len=_page,
+            slot_size_bytes=_page,
+            block_stride=(stride[0] if len(stride) > 0 else _page // element_size),
+            local_kv_stride=None,
+            remote_kv_stride=None,
+            transfers_per_block=1,
+            regions_per_block=1,
+            split_kv_regions=False,
+        )
     cache_kind = "MLA" if is_mla_cache else "K/V"
     raise ValueError(
         f"Unsupported MoRIIO {cache_kind} cache shape for layer "
@@ -301,6 +326,86 @@ def merge_contiguous_offsets(
     )
 
 
+def compute_mamba_block_transfer_offsets(
+    layer_name,
+    kv_cache,
+    spec,
+    local_block_ids,
+    remote_block_ids,
+    remote_num_blocks,
+    merge_fn,
+):
+    """k3-kda: byte offsets for a mamba (KDA/GDN) layer's conv+ssm sub-regions.
+
+    Emits, per (local_block, remote_block) pair, one transfer per sub-region:
+    conv sub-projections [Q,K,V] then the ssm/recurrent state. Homogeneous TP
+    only (P_TP == D_TP); tp_ratio == 1 so remote offsets == local offsets.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+        derive_mamba_conv_split,
+    )
+
+    # k3-kda DIAGNOSTIC: MORIIO_SKIP_MAMBA=1 no-ops the KDA/mamba state transfer
+    # (MLA KV still transfers). If the producer stops GPU-faulting under this flag,
+    # the fault is isolated to the KDA state write path (expected). Output on the
+    # ~69 KDA layers is then wrong (state not handed off) but the run must COMPLETE.
+    import os as _os
+    if _os.environ.get("MORIIO_SKIP_MAMBA", "0") == "1":
+        return [], [], []
+
+    if len(local_block_ids) > len(remote_block_ids):
+        raise ValueError(
+            "local_block_ids longer than remote_block_ids (mamba): "
+            f"{len(local_block_ids)} > {len(remote_block_ids)}"
+        )
+
+    split = derive_mamba_conv_split(spec, local_tp=1)
+    conv_bytes, ssm_bytes = split.ssm_sizes
+    # Sub-regions within one page: conv sub-projections, then ssm.
+    subregions = list(split.local_conv_offsets)  # [(off,size), ...] for Q,K,V
+    subregions.append((int(conv_bytes), int(ssm_bytes)))  # ssm follows conv
+
+    # k3-kda: block stride MUST be the PHYSICAL page (spec.page_size_bytes),
+    # which the hybrid allocator pads (e.g. "Padding mamba page size by 8.68%")
+    # so the mamba page matches the attention page. The unpadded conv+ssm size
+    # (conv_bytes+ssm_bytes) is only the live data within a page; using it as the
+    # block stride drifts every block offset by (padded-unpadded) per block ->
+    # higher block IDs land out of bounds -> RDMA writes fault the GPU. The tensor
+    # itself is [num_blocks, 1, 1, page_size_bytes] (gpu_model_runner reshape), so
+    # stride = spec.page_size_bytes is the correct block spacing.
+    stride = int(spec.page_size_bytes)
+
+    n = len(local_block_ids) * len(subregions)
+    offset_local = [0] * n
+    offset_remote = [0] * n
+    sizes = [0] * n
+    w = 0
+    # k3-kda bounds check: the local mamba cache tensor spans
+    # num_blocks * page_size_bytes; any (offset+size) beyond it is an OOB RDMA
+    # address -> GPU memory fault. Validate + log before scheduling the write.
+    try:
+        _tensor_bytes = int(kv_cache.numel()) * int(kv_cache.element_size())
+    except Exception:
+        _tensor_bytes = -1
+    for lb, rb in zip(local_block_ids, remote_block_ids):
+        lbase = lb * stride
+        rbase = rb * stride
+        for off, sz in subregions:
+            offset_local[w] = lbase + off
+            offset_remote[w] = rbase + off  # tp_ratio==1 -> same sub-offset
+            sizes[w] = sz
+            if _tensor_bytes >= 0 and (lbase + off + sz) > _tensor_bytes:
+                import logging as _lg
+                _lg.getLogger(__name__).error(
+                    "[k3-kda OOB] layer=%s lb=%d off=%d sz=%d end=%d > "
+                    "tensor_bytes=%d (stride=%d page_size_bytes=%d num_local=%d)",
+                    layer_name, lb, off, sz, lbase + off + sz, _tensor_bytes,
+                    stride, int(spec.page_size_bytes), len(local_block_ids),
+                )
+            w += 1
+    return merge_fn(offset_local, offset_remote, sizes)
+
+
 def compute_block_transfer_offsets(
     layer_name: str,
     kv_cache: torch.Tensor,
@@ -312,6 +417,13 @@ def compute_block_transfer_offsets(
         [list[int], list[int], list[int]], tuple[list[int], list[int], list[int]]
     ] = merge_contiguous_offsets,
 ) -> tuple[list[int], list[int], list[int]]:
+    from vllm.v1.kv_cache_interface import MambaSpec as _K3MambaSpec  # k3-kda
+    _spec = layer_to_spec[layer_name]
+    if isinstance(_spec, _K3MambaSpec):  # k3-kda: conv/ssm sub-regions
+        return compute_mamba_block_transfer_offsets(
+            layer_name, kv_cache, _spec, local_block_ids,
+            remote_block_ids, remote_num_blocks, merge_fn,
+        )
     # A shorter (or empty) local list is the READ-mode "drop the transfer, just
     # free the prefill blocks" case (full-prefix-hit / aborted-before-scheduled):
     # decode pulls fewer blocks than the prefill holds. The zip loop below pairs
