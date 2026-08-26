@@ -877,22 +877,6 @@ class MoRIIOConnectorScheduler:
                         [list(g) for g in _k3_gbi_d]
                         if num_external_tokens > 0 else []
                     )
-                    # The target rank may live on a child pod at a different IP,
-                    # so resolve the per-pod host (pod_idx = global // dp_local).
-                    # Otherwise a notify for child ranks lands on the master
-                    # pod and the request hangs in WAITING_FOR_REMOTE_KVS.
-                    _notify_host = remote_host
-                    _kvp = request.kv_transfer_params or {}
-                    _remote_hosts = _kvp.get("remote_hosts") or []
-                    if _dp_local > 0 and _remote_hosts:
-                        _pod_idx = pod_index(remote_dp_rank, _dp_local)
-                        if 0 <= _pod_idx < len(_remote_hosts):
-                            _notify_host = _remote_hosts[_pod_idx]
-                    for tp_index in range(self.tp_size):
-                        target_port = remote_notify_port + get_port_offset(
-                            _remote_dp_rank_for_port, tp_index
-                        )
-
                     # Wide-EP multi-pod: a pod binds notify sockets only for
                     # its LOCAL ranks, so the port offset must use the per-pod
                     # local rank (% dp_local), not the global rank. Single-pod
