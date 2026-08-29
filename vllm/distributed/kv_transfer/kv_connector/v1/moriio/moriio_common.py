@@ -98,6 +98,16 @@ class RemoteAllocInfo:
         tuple[tuple[int, ...], tuple[int, ...], torch.dtype],
         tuple[list[int], list[int], list[int]],
     ] = field(default_factory=dict)
+    # k3-readback: last write's session + a remote offset so _finalize_if_complete
+    # can issue an RDMA read-after-write (forces the written KV globally visible in
+    # the receiver's HBM before write_done) -- deterministic fix for the concurrency
+    # write-race vs a guessed K3_WRITE_FENCE sleep. Gated by K3_WRITE_READBACK=1.
+    readback_session: Any = None
+    readback_remote_offset: int | None = None
+    # k3-readback: accumulate (session, remote_offset) for EACH write so the
+    # barrier reads back every written region (KV spans many blocks/layers/groups;
+    # a single-offset readback leaves some regions racing). Bounded sample.
+    readback_targets: list[Any] = field(default_factory=list)
 
 
 class ROLE(Enum):

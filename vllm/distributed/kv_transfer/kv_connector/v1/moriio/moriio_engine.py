@@ -366,6 +366,22 @@ class MoRIIOWriter:
         transfer_statuses = self._do_layer_write(plan, sessions)
         with self._write_state_lock:
             request_info.transfer_statuses.extend(transfer_statuses)
+            # k3-readback: stash (session, remote_offset) for EACH written region so
+            # _finalize_if_complete can RDMA read-after-write ALL of them (KV spans
+            # many blocks/layers/groups; one offset leaves regions racing). Bounded.
+            try:
+                _rb_sess = sessions[plan.sess_idx]
+                _rb_offs = plan.transfer_remote_offsets
+                if not isinstance(_rb_offs, (list, tuple)):
+                    _rb_offs = [_rb_offs]
+                for _o in _rb_offs:
+                    request_info.readback_targets.append((_rb_sess, int(_o)))
+                # keep the last as the legacy single-target too
+                if _rb_offs:
+                    request_info.readback_session = _rb_sess
+                    request_info.readback_remote_offset = int(_rb_offs[-1])
+            except Exception:
+                pass
 
         # Finalize if all layers complete
         self._mark_write_done(task.transfer_id, request_info)
@@ -506,6 +522,43 @@ class MoRIIOWriter:
 
         # Wait for this request's transfers to complete.
         self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)
+
+        # k3-readback: RDMA read-after-write to force the just-written KV globally
+        # VISIBLE in the receiver's HBM before write_done. status.Succeeded() above
+        # only means the sender WR completed (data left our NIC); on RoCE that does
+        # NOT guarantee the remote HBM is updated. A tiny read to the same remote
+        # session/offset is ordered after the writes -> when it returns, the writes
+        # are globally visible. Deterministic replacement for the K3_WRITE_FENCE
+        # sleep. Gated (opt-in) so it can be A/B'd and reverted.
+        import os as _k3rbos
+        if _k3rbos.environ.get("K3_WRITE_READBACK", "") in ("1", "true", "on"):
+            _rb_targets = list(request_info.readback_targets)
+            if not _rb_targets and request_info.readback_session is not None \
+                    and request_info.readback_remote_offset is not None:
+                _rb_targets = [(
+                    request_info.readback_session,
+                    request_info.readback_remote_offset,
+                )]
+            if _rb_targets:
+                try:
+                    _rb_bytes = int(_k3rbos.environ.get("K3_WRITE_READBACK_BYTES", "8"))
+                    # Cap the number of readbacks (each is a tiny RDMA read); a
+                    # sample across the written regions is enough to order-fence
+                    # the whole batch of writes to the same QP.
+                    _rb_cap = int(_k3rbos.environ.get("K3_WRITE_READBACK_MAX", "64"))
+                    _rb_stats = []
+                    for _rb_sess, _rb_off in _rb_targets[:_rb_cap]:
+                        _rb_stats.append(
+                            self.worker.moriio_wrapper.read_remote_data(
+                                _rb_bytes,
+                                local_offset=0,
+                                remote_offset=_rb_off,
+                                session=_rb_sess,
+                            )
+                        )
+                    self.worker.moriio_wrapper.waiting_for_transfer_complete(_rb_stats)
+                except Exception as _rb_e:
+                    logger.warning("k3-readback failed (%s); continuing", _rb_e)
 
         # The notify port offset must use the per-pod local rank
         # (% dp_local), since each pod binds notify sockets only for its local
