@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import os
 import torch
 
 import vllm.envs as envs
@@ -293,6 +294,7 @@ def set_forward_context(
         if (
             num_tokens_across_dp is None
             and vllm_config.parallel_config.data_parallel_size > 1
+            and not int(os.environ.get("VLLM_SKIP_FWDCTX_DP_AR", "1"))
         ):
             assert ubatch_slices is None
             assert num_tokens is not None
@@ -304,7 +306,8 @@ def set_forward_context(
             assert num_tokens_across_dp is not None
         elif num_tokens_across_dp is None:
             assert num_tokens is not None
-            num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int32)
+            _dp = vllm_config.parallel_config.data_parallel_size
+            num_tokens_across_dp = torch.full((_dp,), num_tokens, dtype=torch.int32) if _dp > 1 else torch.tensor([num_tokens], dtype=torch.int32)
         dp_metadata = DPMetadata.make(
             vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp
         )

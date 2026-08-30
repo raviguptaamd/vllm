@@ -97,7 +97,7 @@ def _convert_req_index_to_global_index_kernel(
     # short/standalone contexts never fault. 0 is masked by paged_kv_indptr/
     # last_page_len, so it reads block 0 harmlessly.
     out_val = tl.where(
-        is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off
+        is_invalid_tok | (~valid_block), -1, base * BLOCK_SIZE + inblock_off
     )
     out_ptr_ij = out_ptr + seq_start + indice_id
     out_ptr_ij_mask = (seq_start + indice_id) < seq_end
@@ -592,7 +592,24 @@ class ROCMAiterMLASparseMetadataBuilder(
             clamped_context_lens.tobytes(),
             _seg_lengths_nr.tobytes(),
         )
-        if metadata_key != self._prev_metadata_key:
+        # PERSISTENT-KERNEL GATE (aiter #4076 / vLLM #47567): the persistent
+        # sparse-MLA work-stealing kernel is numerically wrong for chunked-prefill
+        # continuation batches; the error compounds and breaks long-context decode.
+        # Fall back to the correct non-persistent path whenever any request in the
+        # batch is a chunked-prefill continuation (>1 query token this step AND
+        # total seq_len > this step's query_len). Decode + single-chunk prefills
+        # keep the fast persistent path -> no decode-throughput regression.
+        # Slice to num_reqs and cast to int64 (vLLM #47567 hardening / Rohan138 PR#1)
+        # so the masks cannot broadcast-mismatch under cudagraph padding.
+        _step_query_lens = seg_lengths[:num_reqs].astype(np.int64)
+        _total_seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs].numpy().astype(
+            np.int64
+        )
+        _is_chunked_continuation = (_step_query_lens > 1) & (
+            _total_seq_lens > _step_query_lens
+        )
+        _use_persistent = not bool(_is_chunked_continuation.any())
+        if _use_persistent and metadata_key != self._prev_metadata_key:
             from aiter import get_mla_metadata_v1
 
             max_split_per_batch = self._sparse_decode_max_split(
@@ -642,7 +659,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            work_meta_data=self._mla_work_meta_data,
+            work_meta_data=(self._mla_work_meta_data if _use_persistent else None),
             work_indptr=self._mla_work_indptr,
             work_info_set=self._mla_work_info_set,
             reduce_indptr=self._mla_reduce_indptr,

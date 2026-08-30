@@ -6,6 +6,10 @@ from typing import NamedTuple
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -319,10 +323,19 @@ def compute_block_transfer_offsets(
     # only what decode allocated and an empty local is a no-op. A longer local
     # list is a genuine bug and still fails loudly.
     if len(local_block_ids) > len(remote_block_ids):
-        raise ValueError(
-            "local_block_ids longer than remote_block_ids: "
-            f"{len(local_block_ids)} > {len(remote_block_ids)}"
+        # Speculative decoding (MTP): the prefill side holds extra TRAILING draft
+        # block(s) for the lookahead token that the decode side has not allocated a
+        # slot for. Truncate to the remote length (keep leading prompt-prefix KV,
+        # drop the trailing draft block); decode recomputes it. See vLLM PR #46694
+        # (NIXL connector analogue). NIAH gates the alignment correctness.
+        logger.warning_once(
+            "local_block_ids longer than remote_block_ids: %d > %d "
+            "(speculative-decode lookahead blocks); truncating trailing surplus "
+            "to align with remote KV transfer.",
+            len(local_block_ids),
+            len(remote_block_ids),
         )
+        local_block_ids = local_block_ids[: len(remote_block_ids)]
     geometry = get_layer_transfer_geometry(
         layer_name, kv_cache, layer_to_spec, remote_num_blocks
     )

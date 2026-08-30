@@ -475,7 +475,12 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
-            self.model_runner.profile_run()
+            # GLM-5.2 EP16+MTP fix: this profile forward runs the MoE all2all at
+            # max_num_batched_tokens and deadlocks cross-node (DP16). Since kv bytes
+            # are preset, profiling is only JIT warmup; gate it so kernels compile
+            # lazily on the first real request instead.
+            if not int(os.environ.get('VLLM_SKIP_PROFILE_RUN', '0')):
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -709,6 +714,13 @@ class Worker(WorkerBase):
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
+        # glm-dsa-indexer-warmup: force-compile the DSA sparse-attention indexer
+        # Triton kernels now (KV cache is allocated), so a large prompt
+        # never JIT-compiles them mid-inference and stalls DP lockstep.
+        # No-op unless this model has a DeepseekV32IndexerBackend.
+        if hasattr(self.model_runner, "_maybe_warmup_dsa_indexer"):
+            self.model_runner._maybe_warmup_dsa_indexer()
+
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
@@ -794,7 +806,7 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif get_pp_group().is_last_rank:
+        elif get_pp_group().is_last_rank and not int(os.environ.get('VLLM_SKIP_WARMUP_DUMMY', '0')):
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
             # fragmentation issue.

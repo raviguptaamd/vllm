@@ -6878,6 +6878,73 @@ class GPUModelRunner(
         return int(total_estimate)
 
     @instrument(span_name="Capture model")
+    def _maybe_warmup_dsa_indexer(self) -> None:
+        """Force-compile the DSA sparse-attention indexer Triton kernels at boot.
+
+        NO-OP unless this model actually has a DeepseekV32IndexerBackend (GLM-5.1
+        DSA / DeepSeek V3.2). The indexer kernels are seq-length specialized
+        (triton_fp8_mqa_logits flips matrix_instr_nonkdim at seq_len<=1024 and
+        launches grid=[(seq_len,)]), and the normal profile/warmup passes never
+        drive the indexer (attn_metadata is None -> the *_fake path). Without this
+        the first large prompt JIT-compiles mid-inference and, under DP lockstep,
+        stalls the whole group. We warm BOTH regimes: a small (<=1024) and a large
+        (max_num_batched_tokens, >1024) prefill batch, using force_attention=True
+        so _dummy_run builds a real indexer metadata via the standard path.
+        """
+        # glm-dsa-indexer-warmup
+        try:
+            from vllm.v1.attention.backends.mla.indexer import (
+                DeepseekV32IndexerBackend,
+            )
+        except Exception:  # noqa: BLE001 -- backend module absent -> not a DSA build
+            return
+
+        has_indexer = False
+        try:
+            for attn_group in self._attn_group_iterator():
+                backend = getattr(attn_group, "backend", None)
+                if backend is not None and isinstance(backend, type) and issubclass(
+                    backend, DeepseekV32IndexerBackend
+                ):
+                    has_indexer = True
+                    break
+        except Exception:  # noqa: BLE001 -- iterator shape changed -> stay a no-op
+            return
+        if not has_indexer:
+            return
+
+        # Two prefill-size regimes so both Triton specializations compile.
+        # Small must be <=1024 rows; large must exceed 1024 (use the real max).
+        max_tokens = int(self.max_num_tokens)
+        small = min(512, max_tokens)
+        sizes = []
+        for s in (small, max_tokens):
+            if s > 0 and s not in sizes:
+                sizes.append(s)
+
+        logger.info(
+            "Warming up DSA indexer kernels at prefill sizes %s "
+            "to avoid mid-inference JIT.",
+            sizes,
+        )
+        for size in sizes:
+            try:
+                self._dummy_run(
+                    size,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    force_attention=True,
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
+            except Exception as e:  # noqa: BLE001 -- warmup must NEVER crash boot
+                logger.warning(
+                    "DSA indexer warmup at size %d failed (%s); the kernel may "
+                    "JIT-compile on first use instead.",
+                    size,
+                    e,
+                )
+        self._sync_device()
+
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(

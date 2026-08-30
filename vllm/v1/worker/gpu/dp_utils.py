@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -102,6 +104,13 @@ def dispatch_cg_and_sync_dp(
             num_reqs=num_reqs,
             num_active_loras=num_active_loras,
         )
+        # GLM-5.2 EP16+MTP fix: on the eager/profile path the DP all_reduce below
+        # early-returns the all-eager NONE descriptor (its result is discarded), but
+        # the collective itself deadlocks when dp ranks reach it asymmetrically across
+        # nodes (one node lags building the fmoe 1tg kernel). Skip it here; real
+        # inference (need_eager=False) still runs the DP padding sync.
+        if int(os.environ.get("VLLM_SKIP_DP_SYNC_ON_PROFILE", "1")):
+            return batch_desc, None
     else:
         assert cudagraph_manager is not None, (
             "cudagraph_manager should only be None during profile run, "
