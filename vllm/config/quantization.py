@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
+    kInt4Static32,
     kInt8StaticChannelSym,
     kMxfp4Dynamic,
     kMxfp4Static,
@@ -33,6 +34,9 @@ QUANT_KEY_NAMES: dict[str, QuantKey] = {
     "mxfp8": kMxfp8Dynamic,
     "mxfp4": kMxfp4Dynamic,
     "int8_per_channel_static": kInt8StaticChannelSym,
+    # Groupwise int4 (32-elem group). Kimi-K3 gfx942: MXFP4 experts requantized
+    # so AITER bf16 x int4 kernels run on hardware without a scaled MXFP4 MFMA.
+    "int4_per_group_32": kInt4Static32,
 }
 
 
