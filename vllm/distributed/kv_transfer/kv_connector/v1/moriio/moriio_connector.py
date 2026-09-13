@@ -2264,8 +2264,19 @@ class MoRIIOConnectorWorker:
                 # the LAST status, not per-layer all(). K3 hybrid writes KV by
                 # KV-cache group; the upstream per-layer dict never completes for
                 # our group transfer -> decode reads incomplete KV -> garbage.
+                # k3-FIX (KV-race): a request's KV is written as a GROUP of
+                # transfers (one status appended per block-group). Completion
+                # must require ALL group transfers to succeed, not just the
+                # last-appended one. The old `status_list[-1].Succeeded()` gate
+                # released the request to decode as soon as the LAST transfer
+                # finished, even while an EARLIER group was still in flight ->
+                # decode read partial/stale KV -> garbled output (bimodal:
+                # clean ~35s vs garbled ~108s). Gate on all()/any() instead.
+                n_total = len(status_list)
+                n_ok = sum(1 for st in status_list if st.Succeeded())
+                n_failed = sum(1 for st in status_list if st.Failed())
                 last = status_list[-1]
-                if last.Succeeded():
+                if n_ok == n_total:
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
@@ -2276,7 +2287,7 @@ class MoRIIOConnectorWorker:
                         message_fields={"consumer_tp_size": self.world_size},
                     )
                     to_remove.append(req_id)
-                elif last.Failed():
+                elif n_failed > 0:
                     logger.error(
                         "RDMA transfer failed for request %s: %s (code=%s). "
                         "Notifying prefill to free blocks; request will be "
