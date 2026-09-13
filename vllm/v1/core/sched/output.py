@@ -267,7 +267,14 @@ class SchedulerOutput:
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
+    # ATTENTION namespace only — consumed by the byte-address Triton kernel.
     new_block_ids_to_zero: list[int] | None = None
+
+    # K3-FIX(#35219): freshly allocated MAMBA (KDA) block IDs, in the mamba
+    # groups' INDEPENDENT block-id namespace. Zeroed pure-torch in the worker
+    # (state[ids] = 0 over dim 0 of each conv/recurrent state view). Kept on a
+    # SEPARATE channel so these ids never reach the attention byte-kernel.
+    new_mamba_block_ids_to_zero: list[int] | None = None
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None

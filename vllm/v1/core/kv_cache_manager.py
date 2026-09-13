@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.single_type_kv_cache_manager import _spec_contains_mamba
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -803,20 +804,55 @@ class KVCacheManager:
         return self.create_kv_cache_blocks(tuple(truncated))
 
     def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
+        """Drain and return new ATTENTION block IDs for the worker byte-kernel.
+
+        K3-FIX(#35219): mamba managers now also record new block ids, but they
+        live in an INDEPENDENT block-id namespace and must not reach the
+        attention byte-address zeroing kernel. Route them out here so this list
+        stays AttentionSpec-only (mamba ids are drained separately via
+        ``take_new_mamba_block_ids``).
+        """
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
+            # K3-FIX(#35219): route any mamba-bearing group (incl. the hybrid
+            # UniformTypeKVCacheSpecs wrapper) to the separate mamba channel so
+            # its ids never reach the attention byte-kernel.
+            if _spec_contains_mamba(mgr.kv_cache_spec):
+                continue
             ids.extend(mgr.take_new_block_ids())
+        return ids
+
+    def take_new_mamba_block_ids(self) -> list[int]:
+        """Drain and return new MAMBA (KDA) block IDs for pure-torch zeroing.
+
+        Separate channel from ``take_new_block_ids``: these index dim 0 of each
+        per-state view in a mamba layer's ``kv_cache`` tuple and are zeroed with
+        ``state[ids] = 0`` in the worker, never by the attention byte-kernel.
+        K3-FIX(#35219): matches MambaSpec AND the hybrid UniformTypeKVCacheSpecs
+        wrapper that bundles KDA(mamba)+MLA(attn) into one unified group.
+        """
+        ids: list[int] = []
+        for mgr in self.coordinator.single_type_managers:
+            if _spec_contains_mamba(mgr.kv_cache_spec):
+                ids.extend(mgr.take_new_block_ids())
         return ids
 
     def get_zeroing_block_ids_in_range(
         self, request_id: str, start_token: int, end_token: int
     ) -> list[int]:
         """The request's block ids covering [start_token, end_token), from
-        the groups whose new blocks are zeroed by the worker."""
+        the groups whose new blocks are zeroed by the worker.
+
+        K3-FIX(#35219): restricted to non-mamba managers. Mamba ids live in a
+        separate namespace and feed a separate zeroing channel; the caller adds
+        these ids to ``_skip_zero_block_ids`` which is applied ONLY to the attn
+        list, so mixing in mamba ids could skip an unrelated attn block that
+        happens to share the same integer id."""
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
-            if mgr.records_new_block_ids:
+            if mgr.records_new_block_ids and not _spec_contains_mamba(
+                mgr.kv_cache_spec
+            ):
                 start_idx = start_token // mgr.block_size
                 end_idx = cdiv(end_token, mgr.block_size)
                 blocks = mgr.req_to_blocks[request_id]

@@ -1288,6 +1288,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+            new_mamba_block_ids_to_zero=self._get_new_mamba_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
@@ -1336,6 +1337,20 @@ class Scheduler(SchedulerInterface):
             skip.clear()
 
         return new_block_ids_to_zero or None
+
+    def _get_new_mamba_block_ids_to_zero(self) -> list[int] | None:
+        # K3-FIX(#35219): separate channel for KDA/mamba block ids. Drain every
+        # step (even when zeroing is disabled) so the manager-side list never
+        # grows unbounded. These ids are zeroed pure-torch in the worker
+        # (state[ids] = 0); they are NOT passed to the attention byte-kernel and
+        # are NOT subject to the attn async-load skip set (mamba state is not
+        # loaded via that path in this deployment).
+        new_mamba_block_ids_to_zero = (
+            self.kv_cache_manager.take_new_mamba_block_ids()
+        )
+        if not self.needs_kv_cache_zeroing:
+            return None
+        return new_mamba_block_ids_to_zero or None
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False

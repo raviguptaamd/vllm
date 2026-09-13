@@ -1039,6 +1039,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
+        # K3-FIX(#35219): the attention byte-kernel (KVBlockZeroer) cannot handle
+        # mamba's (conv,recurrent) page layout, so KDA/mamba state blocks are
+        # zeroed here pure-torch on a SEPARATE channel. Fixes con>1 state poison
+        # from recycled-but-unzeroed KDA slots. Runs in update_requests (eager,
+        # outside cudagraph capture); touches only mamba state, not the int4 MoE.
+        _mz_ids = getattr(scheduler_output, "new_mamba_block_ids_to_zero", None)
+        if _mz_ids:
+            self._zero_mamba_block_ids(_mz_ids)
+
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
@@ -1047,6 +1056,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
+
+    def _zero_mamba_block_ids(self, block_ids: list[int]) -> None:
+        """Zero freshly (re)allocated MAMBA/KDA state blocks, pure-torch.
+
+        K3-FIX(#35219): a mamba layer's ``kv_cache`` is a tuple of per-state
+        views each shaped ``[num_blocks, *state_shape]`` (dim 0 = block index,
+        see MambaBase.bind_kv_cache), so ``state[ids] = 0`` zeros exactly the
+        given blocks. Independent of cudagraph capture (runs in update_requests)
+        and of the int4 MoE path (touches only KDA conv/recurrent state).
+        """
+        if not block_ids:
+            return
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        fwd_ctx = self.compilation_config.static_forward_context
+        ids_tensor = None
+        for layer in fwd_ctx.values():
+            if not isinstance(layer, MambaBase):
+                continue
+            kv_cache = getattr(layer, "kv_cache", None)
+            if not isinstance(kv_cache, tuple) or not kv_cache:
+                continue
+            if ids_tensor is None:
+                ids_tensor = torch.as_tensor(
+                    block_ids, dtype=torch.long, device=kv_cache[0].device
+                )
+            for state in kv_cache:
+                state[ids_tensor] = 0
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool

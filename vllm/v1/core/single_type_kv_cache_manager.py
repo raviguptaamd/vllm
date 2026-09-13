@@ -28,9 +28,24 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+
+def _spec_contains_mamba(spec: KVCacheSpec) -> bool:
+    """True if ``spec`` is a MambaSpec or a UniformTypeKVCacheSpecs that wraps
+    one. K3-FIX(#35219): hybrid Kimi-K3 unifies KDA(mamba)+MLA(attn) layers into
+    a single UniformTypeKVCacheSpecs group, so a bare ``isinstance(spec,
+    MambaSpec)`` misses the mamba state that still needs zero-on-(re)alloc."""
+    if isinstance(spec, MambaSpec):
+        return True
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return any(
+            isinstance(s, MambaSpec) for s in spec.kv_cache_specs.values()
+        )
+    return False
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -83,8 +98,17 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and isinstance(
-            kv_cache_spec, AttentionSpec
+        # K3-FIX(#35219): record for attention (byte-kernel) AND for any spec
+        # that CONTAINS mamba state (KDA). Kimi-K3 is a HYBRID model whose
+        # layers are unified into one group wrapped in UniformTypeKVCacheSpecs
+        # (neither AttentionSpec nor MambaSpec), so a plain isinstance check
+        # misses it entirely — we must unwrap the uniform wrapper. Mamba ids are
+        # drained on a SEPARATE channel downstream
+        # (KVCacheManager.take_new_mamba_block_ids + new_mamba_block_ids_to_zero)
+        # and zeroed pure-torch in the worker, never via the attention byte-kernel.
+        self._spec_has_mamba = _spec_contains_mamba(kv_cache_spec)
+        self._record_new_block_ids = needs_kv_cache_zeroing and (
+            isinstance(kv_cache_spec, AttentionSpec) or self._spec_has_mamba
         )
         self.new_block_ids: list[int] = []
 
