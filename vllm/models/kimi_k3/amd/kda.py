@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import torch
 from einops import rearrange
 from torch import nn
@@ -319,6 +320,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
+        # K3-FIX(#35219 sibling): m.non_spec_state_indices_tensor is a VIEW into a
+        # shared block-table buffer that the cudagraph dummy path can zero in place.
+        # Clone once so every downstream decode write indexes a private, stable
+        # tensor. Eager region (@eager_break_during_capture) -> no cudagraph cost.
+        if non_spec_state_indices_tensor is not None:
+            non_spec_state_indices_tensor = non_spec_state_indices_tensor.clone()
         spec_sequence_masks = m.spec_sequence_masks
         spec_token_indx = m.spec_token_indx
         non_spec_token_indx = m.non_spec_token_indx
