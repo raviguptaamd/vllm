@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import mori
+import os
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -10,6 +11,61 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+def _is_stream_capturing() -> bool:
+    try:
+        return (
+            current_platform.is_cuda_alike()
+            and torch.cuda.is_current_stream_capturing()
+        )
+    except Exception:
+        return False
+
+
+def _trim_dispatch_output(
+    dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights,
+    dispatch_recv_token_num, ep_size, topk, input_num_tokens,
+):
+    orig_rows = dispatch_a1.shape[0]
+    # ep-factor: real routing is balanced, so worst-case *ep_size overcounts ~ep_size x.
+    # Tunable via env; default 2 (small skew margin) instead of ep_size.
+    try:
+        _epf = int(os.environ.get("K3_TRIM_EP_FACTOR", "2"))
+    except Exception:
+        _epf = 2
+    _capturing = _is_stream_capturing()
+    exact = None
+    if _capturing:
+        valid_rows = input_num_tokens * topk * _epf
+    elif dispatch_recv_token_num is not None and dispatch_recv_token_num.numel() > 0:
+        exact = int(dispatch_recv_token_num.reshape(-1)[0].item())
+        valid_rows = exact
+    else:
+        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+    # Diagnostic: compare bound vs truth vs prealloc (eager path knows the truth).
+    if os.environ.get("K3_TRIM_LOG", "0") == "1":
+        _bound_full = input_num_tokens * topk * ep_size
+        logger.warning(
+            "[K3_TRIM] cap=%s orig=%d bound_epf%d=%d bound_full=%d exact=%s in_tok=%d",
+            _capturing, orig_rows, _epf, input_num_tokens * topk * _epf,
+            _bound_full, exact, input_num_tokens,
+        )
+    # KEY FIX: always trim to < orig_rows (never bail to full buffer). If the bound
+    # meets/exceeds prealloc, cap just under it so AITER never sees the full
+    # oversized buffer (that no-op was why con=32 corrupted).
+    if valid_rows <= 0:
+        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+    valid_rows = min(valid_rows, orig_rows - 1)
+    if valid_rows >= orig_rows:
+        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+    dispatch_a1 = dispatch_a1[:valid_rows]
+    dispatch_ids = dispatch_ids[:valid_rows]
+    dispatch_weights = dispatch_weights[:valid_rows]
+    if dispatch_scale is not None:
+        dispatch_scale = dispatch_scale[:valid_rows]
+    return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -109,6 +165,16 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dispatch_recv_token_num,
         ) = self.mori_op.dispatch(a1, topk_weights, scale, topk_ids)
 
+        dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights = (
+            _trim_dispatch_output(
+                dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights,
+                dispatch_recv_token_num,
+                ep_size=self.num_dispatchers_,
+                topk=topk_ids.shape[1],
+                input_num_tokens=a1.shape[0],
+            )
+        )
+
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
         )
@@ -136,4 +202,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             None,
             self._original_topk_ids,
         )[0]
+        # MoE->state boundary sanitize: zero any non-finite rows before they can
+        # be written into the persistent KDA-mamba recurrent state (which feeds
+        # back every step -> one NaN poisons the block permanently -> block reuse
+        # poisons later con=1 requests). Breaks the accumulation loop.
+        if os.environ.get("K3_SANITIZE_MOE", "1") == "1":
+            if os.environ.get("K3_MOE_NAN_LOG", "0") == "1":
+                _bad = (~torch.isfinite(result)).sum().item()
+                if _bad:
+                    logger.warning("[K3_SANITIZE_MOE] zeroed %d non-finite MoE rows/elems", _bad)
+            result = torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
         output.copy_(result[:num_token])
