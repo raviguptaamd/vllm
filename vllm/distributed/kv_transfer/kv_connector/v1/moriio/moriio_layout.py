@@ -110,9 +110,30 @@ def get_layer_transfer_geometry(
     spec = layer_to_spec[layer_name]
     is_mla_cache = is_mla_cache_layer(layer_to_spec, layer_name)
 
-    if is_mla_cache and len(shape) == 3:
+    if len(shape) == 3:
         num_blocks, block_size, latent_dim = shape
         slot_size_bytes = latent_dim * element_size
+        block_len = block_size * slot_size_bytes
+        return LayerTransferGeometry(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            block_len=block_len,
+            slot_size_bytes=slot_size_bytes,
+            block_stride=stride[0],
+            local_kv_stride=None,
+            remote_kv_stride=None,
+            transfers_per_block=1,
+            regions_per_block=1,
+            split_kv_regions=False,
+        )
+
+    if len(shape) == 4:
+        # DSA indexer tail_cache: (num_blocks, 2, block_size, head_dim) where
+        # dim1=2 packs K|score. Single contiguous per-block region; transfer
+        # the whole block (both halves together). Correct for same-TP P/D.
+        num_blocks = shape[0]
+        block_size = shape[2]
+        slot_size_bytes = shape[1] * shape[3] * element_size
         block_len = block_size * slot_size_bytes
         return LayerTransferGeometry(
             num_blocks=num_blocks,
@@ -301,6 +322,49 @@ def merge_contiguous_offsets(
     )
 
 
+def _mla_kernel_blocks_per_group_block(
+    layer_name: str,
+    kv_cache: "torch.Tensor",
+    layer_to_spec,
+    num_group_blocks=None,
+) -> int:
+    """Kernel-blocks-per-group-block (kbpb) for an MLA cache layer.
+
+    vLLM's hybrid KV allocator assigns block-ids in the *group* block unit
+    (all cache groups share one group-block count). An MLA cache tensor is
+    paged at its own kernel block_size, so it holds num_group_blocks * kbpb
+    kernel blocks (GLM-5.3-Flash: self_attn.attn 87678/4871=18,
+    indexer.k_cache 43839/4871=9). Prefer the true group-block count; the
+    spec.block_size // kernel_block_size fallback is correct only for .attn.
+    Returns 1 (no expansion) for non-MLA layers or when counts don't divide.
+    """
+    try:
+        if not is_mla_cache_layer(layer_to_spec, layer_name):
+            return 1
+        shape = kv_cache.shape
+        if len(shape) != 3:
+            return 1
+        num_kernel_blocks = int(shape[0])
+        if (
+            num_group_blocks
+            and num_group_blocks > 0
+            and num_kernel_blocks % num_group_blocks == 0
+        ):
+            return max(1, num_kernel_blocks // num_group_blocks)
+        kernel_bs = int(shape[1])
+        spec = layer_to_spec[layer_name]
+        grp_bs = int(getattr(spec, "block_size", kernel_bs) or kernel_bs)
+        if (
+            grp_bs > kernel_bs
+            and grp_bs % kernel_bs == 0
+            and num_kernel_blocks % (grp_bs // kernel_bs) == 0
+        ):
+            return grp_bs // kernel_bs
+        return 1
+    except Exception:
+        return 1
+
+
 def compute_block_transfer_offsets(
     layer_name: str,
     kv_cache: torch.Tensor,
@@ -311,6 +375,7 @@ def compute_block_transfer_offsets(
     merge_fn: Callable[
         [list[int], list[int], list[int]], tuple[list[int], list[int], list[int]]
     ] = merge_contiguous_offsets,
+    num_group_blocks=None,
 ) -> tuple[list[int], list[int], list[int]]:
     # A shorter (or empty) local list is the READ-mode "drop the transfer, just
     # free the prefill blocks" case (full-prefix-hit / aborted-before-scheduled):
@@ -323,6 +388,20 @@ def compute_block_transfer_offsets(
             "local_block_ids longer than remote_block_ids: "
             f"{len(local_block_ids)} > {len(remote_block_ids)}"
         )
+    # MLA group->kernel block expansion: a group block-id N covers kbpb
+    # contiguous kernel sub-blocks [N*kbpb .. N*kbpb+kbpb-1]. Expand both id
+    # lists so each kernel sub-block transfers at its native kernel offset.
+    # kbpb == 1 (the common case) leaves the lists unchanged.
+    kbpb = _mla_kernel_blocks_per_group_block(
+        layer_name, kv_cache, layer_to_spec, num_group_blocks
+    )
+    if kbpb > 1:
+        local_block_ids = [
+            lb * kbpb + j for lb in local_block_ids for j in range(kbpb)
+        ]
+        remote_block_ids = [
+            rb * kbpb + j for rb in remote_block_ids for j in range(kbpb)
+        ]
     geometry = get_layer_transfer_geometry(
         layer_name, kv_cache, layer_to_spec, remote_num_blocks
     )

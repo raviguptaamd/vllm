@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
@@ -189,7 +190,7 @@ def resolve_moriio_transfer_ack(
     return transfer_id
 
 
-class MoRIIOConnector(KVConnectorBase_V1):
+class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -286,6 +287,17 @@ class MoRIIOConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        flat_block_ids: list[int] = []
+        for group in block_ids:
+            flat_block_ids.extend(group)
+        return self.connector_scheduler.request_finished(request, flat_block_ids)
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self.connector_scheduler is not None
@@ -512,6 +524,7 @@ class MoRIIOConnectorScheduler:
         req_id: ReqId,
         transfer_id: TransferId,
         block_notify_list: list[int],
+        all_group_block_notify=None,
         host=None,
         port=None,
     ):
@@ -527,6 +540,7 @@ class MoRIIOConnectorScheduler:
             "req_id": req_id,
             "transfer_id": transfer_id,
             "block_notify_list": block_notify_list or [],
+            "all_group_block_notify": all_group_block_notify,
             # GLOBAL decode dp rank: producer derives the per-pod notify offset
             # (% dp_local), owning pod index (// dp_local), and write-target
             # from it. Sending the LOCAL rank made child-pod consumers look
@@ -642,7 +656,13 @@ class MoRIIOConnectorScheduler:
         request_id = request.request_id
         self.map_request_id(request_id, transfer_id)
         if params.get("do_remote_decode"):
-            local_block_ids = blocks.get_block_ids()[0]
+            _all_gids = blocks.get_block_ids()
+            local_block_ids = _all_gids[0]
+            if not hasattr(self, "_req_all_group_bids"):
+                self._req_all_group_bids = {}
+            self._req_all_group_bids[request.request_id] = [
+                list(g) for g in _all_gids
+            ]
             self._reqs_need_save[request.request_id] = (request, local_block_ids)
             # Snapshot params now so chunked-prefill build_connector_meta
             # can recover them on the final chunk even if the live
@@ -763,10 +783,15 @@ class MoRIIOConnectorScheduler:
 
                     # num_external_tokens == 0: nothing to push, so don't tell
                     # the producer to write into these blocks.
+                    _notify_all_gids = blocks.get_block_ids()
                     block_notify_list = (
-                        blocks.get_block_ids()[0] if num_external_tokens > 0 else []
+                        _notify_all_gids[0] if num_external_tokens > 0 else []
                     )
-
+                    all_group_block_notify = (
+                        [list(g) for g in _notify_all_gids]
+                        if num_external_tokens > 0
+                        else None
+                    )
                     # Wide-EP multi-pod: a pod binds notify sockets only for
                     # its LOCAL ranks, so the port offset must use the per-pod
                     # local rank (% dp_local), not the global rank. Single-pod
@@ -794,6 +819,7 @@ class MoRIIOConnectorScheduler:
                             req_id=request.request_id,
                             transfer_id=request.kv_transfer_params["transfer_id"],
                             block_notify_list=block_notify_list,
+                            all_group_block_notify=all_group_block_notify,
                             host=_notify_host,
                             port=target_port,
                         )
@@ -843,6 +869,9 @@ class MoRIIOConnectorScheduler:
                             local_block_ids=self._reqs_need_pending_save[req_id][1],
                             kv_transfer_params=kv_params,
                             write_mode=True,
+                            all_group_local_block_ids=getattr(
+                                self, "_req_all_group_bids", {}
+                            ).get(req_id),
                         )
                         del self._reqs_need_pending_save[req_id]
 
@@ -866,6 +895,9 @@ class MoRIIOConnectorScheduler:
                 local_block_ids=block_ids,
                 kv_transfer_params=kv_params,
                 write_mode=True,
+                all_group_local_block_ids=getattr(
+                    self, "_req_all_group_bids", {}
+                ).get(req_id),
             )
         # Clear the list once workers start the transfers
 
@@ -1102,6 +1134,16 @@ class MoRIIOConnectorWorker:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
+        # Map layer -> KV-cache group idx (same order as get_block_ids()).
+        # Hybrid models split attention/mamba/indexer into groups with
+        # different block sizes; group-0 ids for mamba scramble state.
+        self.layer_to_group_idx = {}
+        try:
+            for _gi, _grp in enumerate(kv_cache_config.kv_cache_groups):
+                for _ln in _grp.layer_names:
+                    self.layer_to_group_idx[_ln] = _gi
+        except Exception:
+            self.layer_to_group_idx = {}
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -1496,8 +1538,11 @@ class MoRIIOConnectorWorker:
                     )  # send local mori io engine meta data
                     logger.debug("MoRIIO handshake listener sent metadata")
                     # now we send tensor meta data for each block
-                    buf = msgpack.dumps(layer_name_to_local_kv_cache_metadata)
-                    sock.send_multipart((identity, b"", buf))
+                    try:
+                        buf = msgpack.dumps(layer_name_to_local_kv_cache_metadata)
+                        sock.send_multipart((identity, b"", buf))
+                    except Exception as _e:
+                        logger.debug("MoRIIO handshake frame2 send failed: %r", _e)
                 elif msg == MoRIIOConstants.POP_DONE_RECV:
                     _, req_id = sock.recv_multipart()
                     logger.debug(
@@ -1673,6 +1718,12 @@ class MoRIIOConnectorWorker:
         all_done_future = self._handshake_initiation_executor.submit(wait_all_dp)
         all_done_future.add_done_callback(request_ready)
 
+    def _is_indexer_skip_layer(self, layer_name: str) -> bool:
+        import os
+        if os.environ.get("INDEXER_SKIP", "0") != "1":
+            return False
+        return ".indexer." in layer_name
+
     def _is_mla_cache_layer(self, layer_name: str) -> bool:
         return is_mla_cache_layer(self.layer_to_spec, layer_name)
 
@@ -1699,6 +1750,17 @@ class MoRIIOConnectorWorker:
         """Register the KV Cache data in moriio."""
 
         self.kv_caches = kv_caches  # layer name to kv cache
+        # Group-block count for the MLA kernel-block (kbpb) expansion in
+        # compute_block_transfer_offsets: the hybrid KV allocator gives all
+        # cache groups one shared group-block count = the min blocks over all
+        # kv_caches. Each MLA tensor is paged at its own kernel block_size and
+        # holds num_group_blocks * kbpb kernel blocks.
+        try:
+            self._num_group_blocks = min(
+                int(t.shape[0]) for t in kv_caches.values()
+            )
+        except ValueError:
+            self._num_group_blocks = None
         self.kv_cache_shapes = {
             layer_name: kv_cache.shape for layer_name, kv_cache in kv_caches.items()
         }
@@ -1756,11 +1818,17 @@ class MoRIIOConnectorWorker:
         caches_data = []
 
         for layer_name in kv_caches:
+            if self._is_indexer_skip_layer(layer_name):
+                continue
             geometry = self._get_layer_transfer_geometry(layer_name)
+            # Hybrid models (GLM-5.3-Flash: MLA bs=64, DSA indexer bs=32, KDA
+            # mamba bs=1) legitimately have per-layer block sizes. block_lens is
+            # already per-layer and transfer offsets are geometry-driven per
+            # layer, so a global block_size mismatch is not an error here.
             if geometry.block_size != self.block_size:
-                raise ValueError(
-                    "MoRIIO KV cache block size mismatch for layer "
-                    f"{layer_name}: {geometry.block_size} != {self.block_size}"
+                logger.info(
+                    "MoRIIO per-layer block_size for %s: %d (global %d)",
+                    layer_name, geometry.block_size, self.block_size,
                 )
             self.block_lens[layer_name] = geometry.block_len
             for cache, region_len in self._iter_layer_registration_regions(layer_name):
@@ -1769,9 +1837,26 @@ class MoRIIOConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
 
         for layer_name, kv_cache in kv_caches.items():
+            if self._is_indexer_skip_layer(layer_name):
+                continue
             if layer_name not in self.layer_name_to_local_kv_cache_metadata:
                 self.layer_name_to_local_kv_cache_metadata[layer_name] = []
 
+            if not kv_cache.is_contiguous():
+                # A non-contiguous KV tensor (e.g. DSA indexer.tail_cache) is a STRIDED
+                # VIEW into a larger padded pool storage. .contiguous() would register a
+                # fresh PACKED copy the model never writes to -> RDMA moves stale bytes ->
+                # garbage. Instead register the tensor's underlying STORAGE (contiguous at
+                # the storage level; the same bytes the model reads/writes). The transfer
+                # geometry uses block_stride=stride[0] (the padded per-block stride), so
+                # offsets address the real strided layout inside this storage.
+                _st = kv_cache.untyped_storage()
+                _flat = torch.empty(0, dtype=kv_cache.dtype, device=kv_cache.device)
+                _flat.set_(_st, 0, (_st.nbytes() // kv_cache.element_size(),))
+                logger.info("MoRIIO NONCONTIG->STORAGE layer=%s shape=%s stride=%s storage_elems=%s",
+                            layer_name, tuple(kv_cache.shape), tuple(kv_cache.stride()),
+                            _st.nbytes() // kv_cache.element_size())
+                kv_cache = _flat
             moriio_mem_metadata = self.moriio_wrapper.register_local_tensor(kv_cache)
             self.layer_name_to_local_kv_cache_metadata[layer_name].append(
                 moriio_mem_metadata
@@ -1784,37 +1869,6 @@ class MoRIIOConnectorWorker:
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
         self.num_regions = len(caches_data)
         self.num_layers = len(self.kv_caches.keys())
-
-        # DSA Bug B fix (GLM-5.1): pair each main-attention KV cache to its DSA
-        # indexer k_cache by layer index, so the producer can transfer the indexer
-        # cache alongside the main one. The indexer module forward() is a no-op (the
-        # write happens inside the fused SparseAttnIndexer op), so the indexer cache
-        # is registered but never calls save_kv_layer; without this the decode pod
-        # selects top-k over a COLD indexer cache -> long-context collapse. The
-        # '.indexer.' substring is the discriminator (78 main + 78 indexer = 156).
-        import re as _glm_re
-
-        _glm_idx_by_lnum: dict[str, str] = {}
-        for _k in self.kv_caches:
-            if ".indexer." not in _k:
-                continue
-            _m = _glm_re.search(r"layers\.(\d+)\.", _k)
-            if _m:
-                _glm_idx_by_lnum[_m.group(1)] = _k
-        self._glm_main_to_indexer: dict[str, str] = {}
-        for _k in self.kv_caches:
-            if ".indexer." in _k:
-                continue
-            _m = _glm_re.search(r"layers\.(\d+)\.", _k)
-            if _m and _m.group(1) in _glm_idx_by_lnum:
-                self._glm_main_to_indexer[_k] = _glm_idx_by_lnum[_m.group(1)]
-        if self._glm_main_to_indexer:
-            logger.info(
-                "[moriio] DSA indexer transfer enabled: paired %d main->indexer "
-                "layers (total caches=%d)",
-                len(self._glm_main_to_indexer),
-                self.num_layers,
-            )
 
         # Optimization for models with local attention (Llama 4)
         if self.vllm_config.model_config.hf_config.model_type == "llama4":
@@ -2066,6 +2120,19 @@ class MoRIIOConnectorWorker:
             return
         if self.mode == MoRIIOMode.READ:
             return
+        if self._is_indexer_skip_layer(layer_name):
+            return
+        import os as _os
+        if _os.environ.get('MORIIO_NO_WRITE') == '1':
+            return
+        # DEFER: skip per-layer writes during the forward (attn_metadata is not
+        # None) so no RDMA batch_write overlaps the MoE/attention compute; the
+        # wait_for_save flush (attn_metadata None, _flushing_saves set) does all
+        # writes after the full forward completes -> no compute/RDMA race.
+        if _os.environ.get('MORIIO_DEFER_WRITES') == '1' \
+                and attn_metadata is not None \
+                and not getattr(self, '_flushing_saves', False):
+            return
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_save.items():
@@ -2260,6 +2327,27 @@ class MoRIIOConnectorWorker:
                 )
 
             self._eager_handshaked_engines.add(remote_engine_id)
+            # EAGER_SESSIONS: build the mori write sessions NOW (at eager-handshake time,
+            # OUTSIDE any model forward) instead of lazily on the first per-request transfer.
+            # mori's CreateSession registers GPU mem for the RDMA QP and MUTATES the HIP
+            # primary context; if that happens DURING a forward, the next multi-chunk DSA
+            # indexer Triton load_binary fails HIP-209 (bisected: CreateSession is the killer,
+            # not BatchWrite). Pre-building here means the per-request path reuses cached
+            # sessions and CreateSession never runs mid-forward. After building, re-assert the
+            # device + a barrier so any ctx mutation settles before model kernels run.
+            import os as _os
+            if _os.environ.get("MORIIO_EAGER_SESSIONS", "1") == "1":
+                try:
+                    for _dp in range(max(1, int(getattr(self, "remote_dp_size", 1) or 1))):
+                        _eid = self.get_engine_name_with_dp(remote_engine_id, _dp)
+                        if _eid in self.layer_name_to_remote_kv_cache_metadata:
+                            self._get_built_session(_eid)
+                    import torch as _t
+                    if _t.cuda.is_available():
+                        _t.cuda.set_device(_t.cuda.current_device())
+                        _t.cuda.synchronize()
+                except Exception as _e:
+                    logger.debug("MoRIIO eager write-session pre-build failed for %s: %r", remote_engine_id, _e)
 
     def start_load_kv(self, metadata: MoRIIOConnectorMetadata):
         """
@@ -2349,10 +2437,54 @@ class MoRIIOConnectorWorker:
         self._reqs_to_send.update(metadata.reqs_to_send)
 
     def wait_for_save(self, metadata: MoRIIOConnectorMetadata):
+        import os as _os
+        if _os.environ.get('MORIIO_NO_WRITE') == '1':
+            return
         if self.mode == MoRIIOMode.WRITE and self.is_producer:
-            for layer_name, kv_layer in self.kv_caches.items():
-                self.save_kv_layer(metadata, layer_name, kv_layer, None)
+            self._flushing_saves = True
+            try:
+                for layer_name, kv_layer in self.kv_caches.items():
+                    self.save_kv_layer(metadata, layer_name, kv_layer, None)
+            finally:
+                self._flushing_saves = False
             self._writer.seal_pending_transfers()
+            # CTXRESTORE: mori's transfer (CreateSession/BatchWrite/RegisterMemory)
+            # leaves this thread's HIP PRIMARY CONTEXT in a state where Triton's
+            # load_binary (_init_handles) fails with HIP-209 "no kernel image" on the
+            # NEXT multi-block prefill (the DSA indexer chunk-metadata kernel). Re-assert
+            # the primary context on THIS (main) thread after the flush so the following
+            # forward's Triton module loads target the valid ctx. set_device -> hipSetDevice
+            # rebinds the primary ctx current; a tiny device op forces it live.
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _dev = _torch.cuda.current_device()
+                    _torch.cuda.set_device(_dev)
+                    _torch.cuda.synchronize(_dev)
+            except Exception:
+                pass
+            # TRITONFLUSH: mori's transfer invalidated the HIP ctx that Triton's
+            # cached kernel MODULE HANDLES were bound to. Clearing each JITFunction's
+            # in-memory device_caches forces _init_handles -> load_binary to RELOAD the
+            # module into the current (restored) ctx on the next launch, instead of
+            # reusing a handle for the dead ctx (HIP-209 "no kernel image"). Cheap: the
+            # .so is on disk; only the in-process handle is re-created.
+            try:
+                import gc as _gc
+                import triton as _triton
+                _JIT = _triton.runtime.jit.JITFunction
+                _n = 0
+                for _o in _gc.get_objects():
+                    try:
+                        if isinstance(_o, _JIT):
+                            _dc = getattr(_o, "device_caches", None)
+                            if _dc:
+                                _dc.clear()
+                                _n += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def _next_flex_tp_rank(self, remote_tp_size: int) -> int:
         """Deterministic round-robin over prefill tp0..N-1 for the flexible read.
@@ -2428,36 +2560,23 @@ class MoRIIOConnectorWorker:
             self.remote_dp_size_local = int(meta.remote_dp_size_local)
         else:
             self.remote_dp_size_local = int(meta.remote_dp_size)
+        _local_ids = meta.local_block_ids
+        _agl = getattr(meta, "all_group_local_block_ids", None)
+        _gidx = self.layer_to_group_idx.get(layer_name, 0)
+        if _agl is not None:
+            if 0 <= _gidx < len(_agl):
+                _local_ids = _agl[_gidx]
         self.schedule_write_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
             dst_engine_id=meta.remote_engine_id,
-            local_block_ids=meta.local_block_ids,
+            local_block_ids=_local_ids,
             remote_block_ids=meta.remote_block_ids,
             layer_name=layer_name,
             kv_layer=kv_layer,
             remote_notify_port=meta.remote_notify_port,
             remote_ip=meta.remote_host,
         )
-        # DSA Bug B fix (GLM-5.1): transfer the paired DSA indexer k_cache too. It is
-        # registered but never goes through save_kv_layer (its module forward() is a
-        # no-op; the write happens inside the fused SparseAttnIndexer op), so without
-        # this the decode pod selects top-k over a COLD indexer cache -> long-context
-        # collapse. Same block_ids / block pool as the main MLA layer; the per-layer
-        # indexer geometry is handled by the geometry-keyed offset cache in the writer.
-        _glm_idx_name = getattr(self, "_glm_main_to_indexer", {}).get(layer_name)
-        if _glm_idx_name is not None:
-            self.schedule_write_blocks(
-                request_id=req_id,
-                transfer_id=meta.transfer_id,
-                dst_engine_id=meta.remote_engine_id,
-                local_block_ids=meta.local_block_ids,
-                remote_block_ids=meta.remote_block_ids,
-                layer_name=_glm_idx_name,
-                kv_layer=self.kv_caches[_glm_idx_name],
-                remote_notify_port=meta.remote_notify_port,
-                remote_ip=meta.remote_host,
-            )
 
     def merge_contiguous_blocks(
         self,
@@ -2566,6 +2685,7 @@ class MoRIIOConnectorWorker:
             local_block_ids=local_block_ids,
             remote_block_ids=remote_block_ids,
             remote_num_blocks=remote_moriio_meta.num_blocks,
+            num_group_blocks=getattr(self, "_num_group_blocks", None),
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
             ),
