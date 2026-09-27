@@ -1657,6 +1657,8 @@ class MoRIIOConnectorWorker:
         self.kv_element_size = 0
         self.kv_cache_shapes: dict[str, torch.Size] = {}
         self.block_lens: dict[str, int] = {}
+        # GLM53_PERGROUP_REMOTE_BLOCKS: per-layer kernel-block counts advertised to peers.
+        self.layer_num_blocks: dict[str, int] = {}
 
         # Map of engine_id -> {agent_name0, agent_name1..}.
         self._remote_agents: dict[EngineId, set[str]] = {}
@@ -2417,6 +2419,10 @@ class MoRIIOConnectorWorker:
                     f"{layer_name}: {geometry.num_blocks} != {self.num_blocks}"
                 )
             self.block_lens[layer_name] = geometry.block_len
+            # GLM53_PERGROUP_REMOTE_BLOCKS: record this layer's own kernel-block count so the
+            # remote consumer can compute per-layer kbpb (hybrid finely-paged
+            # DSA indexer k_cache) instead of the scalar-derived guess.
+            self.layer_num_blocks[layer_name] = geometry.num_blocks
             for cache, region_len in self._iter_layer_registration_regions(layer_name):
                 base_addr = cache.data_ptr()
                 caches_data.append((base_addr, region_len, cache.device.index, ""))
@@ -2534,6 +2540,7 @@ class MoRIIOConnectorWorker:
             num_blocks=self.num_blocks,
             block_len=self.block_len,
             attn_backend_name=self.backend_name,
+            layer_num_blocks=self.layer_num_blocks,  # GLM53_PERGROUP_REMOTE_BLOCKS
         )
         ready_event = threading.Event()
         self._moriio_handshake_listener_t = threading.Thread(
@@ -3314,7 +3321,11 @@ class MoRIIOConnectorWorker:
             layer_to_spec=self.layer_to_spec,
             local_block_ids=local_block_ids,
             remote_block_ids=remote_block_ids,
-            remote_num_blocks=remote_moriio_meta.num_blocks,
+            # GLM53_PERGROUP_REMOTE_BLOCKS: use the peer's per-layer kernel-block count when it
+            # advertised one (new peers); fall back to the scalar for old peers.
+            remote_num_blocks=remote_moriio_meta.layer_num_blocks.get(
+                layer_name, remote_moriio_meta.num_blocks
+            ),
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
             ),
