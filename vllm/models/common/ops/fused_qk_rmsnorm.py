@@ -221,3 +221,50 @@ def fused_q_kv_rmsnorm(
 
 
 _FUSED_Q_KV_RMSNORM_KERNEL = FusedQKVRMSNormKernel()
+
+
+# ===================== GLM53_FUSED_QK_RMSNORM_OP (L2c: opaque custom-op) =====================
+# Make fused_q_kv_rmsnorm an opaque torch.ops.vllm.* op so PIECEWISE cudagraph
+# capture does not trace into its raw @triton.jit kernel.
+import torch as _t_glm53
+from vllm.logger import init_logger as _init_logger_glm53
+_logger_glm53 = _init_logger_glm53(__name__)
+
+try:
+    try:
+        from vllm.utils.torch_utils import direct_register_custom_op as _drc_glm53
+    except Exception:
+        from vllm.utils import direct_register_custom_op as _drc_glm53
+
+    _glm53_orig_fused_q_kv_rmsnorm = fused_q_kv_rmsnorm
+
+    def _glm53_fused_qk_rmsnorm_op(
+        qr: _t_glm53.Tensor,
+        kv: _t_glm53.Tensor,
+        q_weight: _t_glm53.Tensor,
+        kv_weight: _t_glm53.Tensor,
+        eps: float,
+    ) -> tuple[_t_glm53.Tensor, _t_glm53.Tensor]:
+        return _glm53_orig_fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)
+
+    def _glm53_fused_qk_rmsnorm_fake(
+        qr, kv, q_weight, kv_weight, eps,
+    ):
+        return _t_glm53.empty_like(qr), _t_glm53.empty_like(kv)
+
+    _drc_glm53(
+        op_name="glm53_fused_qk_rmsnorm",
+        op_func=_glm53_fused_qk_rmsnorm_op,
+        mutates_args=[],
+        fake_impl=_glm53_fused_qk_rmsnorm_fake,
+    )
+
+    def fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps):  # noqa: F811
+        return _t_glm53.ops.vllm.glm53_fused_qk_rmsnorm(qr, kv, q_weight, kv_weight, eps)
+
+    _logger_glm53.info("GLM53_FUSED_QK_RMSNORM_OP: fused_q_kv_rmsnorm registered as opaque custom op "
+                       "torch.ops.vllm.glm53_fused_qk_rmsnorm")
+except Exception as _e_glm53:
+    _logger_glm53.warning("GLM53_FUSED_QK_RMSNORM_OP: registration FAILED (%s); keeping raw fn "
+                          "(eager ok, PIECEWISE still broken)", _e_glm53)
+# =================== end GLM53_FUSED_QK_RMSNORM_OP ===================
