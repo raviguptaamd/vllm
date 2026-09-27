@@ -292,6 +292,34 @@ def sparse_attn_indexer_kpool(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
+    # GLM53_DISAGG_INDEXER_KV_BARRIER: on the PD DECODE (consumer) leg the indexer's index
+    # k_cache and kpool tail_cache arrive over MoRIIO RDMA. Unlike the dense
+    # attention layers (wrapped by @maybe_transfer_kv_layer), the indexer has
+    # no PD read barrier, so it can read these caches before their transfer
+    # lands -> intermittent long-context recall garbage. Block until both
+    # layers' reads have completed, exactly as the dense layers do. No-ops on
+    # the producer leg / non-READ mode / FULL-cudagraph capture (see
+    # MoRIIOConnector.wait_for_layer_load). Runs in the eager indexer body.
+    if isinstance(attn_metadata, dict):
+        try:
+            from vllm.distributed.kv_transfer.kv_transfer_state import (
+                get_kv_transfer_group as _glm53_get_kvt,
+                has_kv_transfer_group as _glm53_has_kvt,
+                is_v1_kv_transfer_group as _glm53_is_v1_kvt,
+            )
+            if _glm53_has_kvt():
+                _glm53_conn = _glm53_get_kvt()
+                if _glm53_is_v1_kvt(_glm53_conn) and _glm53_conn.has_connector_metadata():
+                    _glm53_conn.wait_for_layer_load(k_cache_prefix)
+                    if tail_prefix is not None:
+                        _glm53_conn.wait_for_layer_load(
+                            _resolve_layer_name(tail_prefix)
+                        )
+        except Exception as _glm53_bar_e:  # never brick serving on a barrier hiccup
+            logger.warning(
+                'GLM53_DISAGG_INDEXER_KV_BARRIER: indexer KV barrier skipped (%s)', _glm53_bar_e
+            )
+
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
