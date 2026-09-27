@@ -237,6 +237,11 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+# GLM53_GDN_HASATTR_FIX: compute the fused-GDN-MTP op availability ONCE at import so the traced
+# decode forward doesn't call hasattr(torch.ops._C, ...) (Dynamo-untraceable -> breaks compile).
+_HAS_FUSED_GDN_DECODE_POST_CONV_MTP = hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -552,7 +557,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "layout, BF16 convolution cache, BF16 or FP32 recurrent "
                 "state, and a GPU with compute capability 8.0+"
             )
-        if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp"):
+        if not _HAS_FUSED_GDN_DECODE_POST_CONV_MTP:
             return "torch.ops._C.fused_gdn_decode_post_conv_mtp is not built"
         return None
 
@@ -1836,7 +1841,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.num_v_heads // self.num_k_heads in (1, 2, 3, 4, 8)
             and state_indices is not None
             and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
-            and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
+            and _HAS_FUSED_GDN_DECODE_POST_CONV_MTP
         )
 
     def _rms_norm_gated_cuda(
