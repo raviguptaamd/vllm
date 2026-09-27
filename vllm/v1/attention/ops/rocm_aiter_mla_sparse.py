@@ -817,11 +817,16 @@ def rocm_fp8_mqa_logits(
     k_fp8, scale = kv
 
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
-        from aiter.ops.flydsl import flydsl_fp8_mqa_logits
-
-        return flydsl_fp8_mqa_logits(
-            q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
-        )
+        # GLM53_FLYDSL_FP8_MQA_IMPORT_GUARD: tip aiter dropped flydsl_fp8_mqa_logits; use it if
+        # present, else fall through to the triton fp8_mqa_logits path below.
+        try:
+            from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+        except ImportError:
+            flydsl_fp8_mqa_logits = None
+        if flydsl_fp8_mqa_logits is not None:
+            return flydsl_fp8_mqa_logits(
+                q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+            )
 
     aiter_mqa_logits_module = None
     if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
