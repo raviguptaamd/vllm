@@ -1180,6 +1180,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             ):
                 factor = self.kv_cache_spec.block_size // kernel_block_size
                 indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+            elif (
+                kernel_block_size is not None
+                and self.kv_cache_spec.block_size != kernel_block_size
+                and kernel_block_size % self.kv_cache_spec.block_size == 0
+            ):
+                # GLM53_KPOOL_SLOT_MAPPING_FIX: on gfx942 the shared hybrid-KV
+                # block_table is at the group's coarse ``kernel_block_size``
+                # (measured 1152 tokens) but the indexer's compressed cache uses
+                # ``spec.block_size`` (128 tokens = ``num_states`` pools) physical
+                # pages, so kernel_block_size > spec.block_size. The existing
+                # branch only DOWNSAMPLES (spec >= kernel); the inverse case fell
+                # through unreconciled, so get_compressed_slot_mapping indexed a
+                # too-short block_table (only ~6 valid entries for 54 needed) ->
+                # pools past that wrapped to block 0 -> up to ~7 pools collapsed
+                # onto ONE physical slot -> pooled KV overwrote each other ->
+                # nondeterministic long-context recall. EXPAND each coarse block
+                # into ``factor`` fine physical blocks so every pool gets a
+                # unique, monotonic slot (matching the gfx950/PR254 geometry).
+                # This corrects BOTH the write (compressed_slot_mapping) and the
+                # read (prefill chunk block_table) since both derive from it.
+                factor = kernel_block_size // self.kv_cache_spec.block_size
+                n_cols = block_table.shape[1]
+                cols = torch.arange(
+                    n_cols * factor, device=block_table.device
+                )
+                indexer_block_table = (
+                    block_table[:, cols // factor] * factor + (cols % factor)
+                ).contiguous()
             padded_num_tokens = num_tokens
             if self.pcp_world_size > 1:
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
@@ -1429,6 +1457,39 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         compressed
                     )
                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
+                elif (
+                    kernel_block_size is not None
+                    and self.kv_cache_spec.block_size != kernel_block_size
+                    and kernel_block_size % self.kv_cache_spec.block_size == 0
+                ):
+                    # GLM53_KPOOL_SLOT_MAPPING_FIX (decode): mirror the prefill
+                    # expansion. The decode paged-MQA reads this block_table with
+                    # block_size = kv_cache.shape[1] = num_states, so its entries
+                    # must be fine (spec.block_size) physical blocks. Expand each
+                    # coarse kernel_block_size entry into ``factor`` fine blocks
+                    # so decode reads the SAME slots the prefill compress wrote.
+                    factor = kernel_block_size // self.kv_cache_spec.block_size
+                    rows, n_cols = block_table.shape
+                    cols = torch.arange(
+                        n_cols * factor, device=block_table.device
+                    )
+                    expanded = (
+                        block_table[:, cols // factor] * factor + (cols % factor)
+                    )
+                    ecols = expanded.shape[1]
+                    if (
+                        self.indexer_decode_block_table_buffer is None
+                        or self.indexer_decode_block_table_buffer.shape[1] < ecols
+                    ):
+                        self.indexer_decode_block_table_buffer = torch.zeros(
+                            (self._max_num_batched_tokens, ecols),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    self.indexer_decode_block_table_buffer[:rows, :ecols].copy_(
+                        expanded
+                    )
+                    block_table = self.indexer_decode_block_table_buffer[:rows, :ecols]
 
             # Flattening always returns a buffer view, including single-token
             # batches. Keep its address stable across varlen graph replays.
