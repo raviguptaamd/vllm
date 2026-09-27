@@ -79,6 +79,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -2651,7 +2652,41 @@ class MoRIIOConnectorWorker:
             else:
                 break
 
+        self._await_mamba_reads()
         self._reqs_to_send.update(metadata.reqs_to_send)
+
+    def _await_mamba_reads(self) -> None:
+        """GLM53_KDA_STATE_READ_BARRIER: block until in-flight Mamba/KDA state READs land.
+
+        Attention layers wait for their own READ in wait_for_layer_load, but no
+        such barrier exists for Mamba/KDA layers, so a transferred request's first
+        step could read a recurrent state that is still arriving. Waiting here, on
+        the host before the forward, also holds when those layers run inside a
+        captured graph.
+        """
+        mamba_layers = {
+            name for name, spec in self.layer_to_spec.items() if isinstance(spec, MambaSpec)
+        }
+        if not mamba_layers:
+            return
+        deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        while True:
+            with self.moriio_wrapper.lock:
+                pending = [
+                    status
+                    for status_by_layer in self._recving_transfers.values()
+                    for layer_name, status in status_by_layer.items()
+                    if layer_name in mamba_layers
+                ]
+            if all(status.Succeeded() or status.Failed() for status in pending):
+                return
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "MoRIIO READ of Mamba/KDA state still in flight after "
+                    "transfer_timeout; proceeding (request dropped via get_finished)."
+                )
+                return
+            time.sleep(0.001)
 
     def wait_for_save(self, metadata: MoRIIOConnectorMetadata):
         if os.environ.get("MORIIO_NO_WRITE") == "1":
