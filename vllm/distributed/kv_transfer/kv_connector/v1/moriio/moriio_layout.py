@@ -1,3 +1,4 @@
+import os  # GLM53_INDEXER_KBPB
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -333,6 +334,22 @@ def merge_contiguous_offsets(
     )
 
 
+def _kernel_blocks_per_group_block(num_kernel_blocks, ref_group_blocks) -> int:
+    """GLM53_INDEXER_KBPB: kernel-blocks-per-group-block (kbpb).
+    Returns num_kernel_blocks/ref_group_blocks when it divides cleanly and
+    num_kernel_blocks>ref (the finely-paged DSA indexer k_cache); else 1
+    (byte-identical no-op for every 1:1 layer).
+    """
+    try:
+        if (ref_group_blocks and ref_group_blocks > 0 and num_kernel_blocks
+                and num_kernel_blocks > ref_group_blocks
+                and num_kernel_blocks % ref_group_blocks == 0):
+            return max(1, num_kernel_blocks // ref_group_blocks)
+    except Exception:
+        pass
+    return 1
+
+
 def compute_block_transfer_offsets(
     layer_name: str,
     kv_cache: torch.Tensor,
@@ -343,6 +360,8 @@ def compute_block_transfer_offsets(
     merge_fn: Callable[
         [list[int], list[int], list[int]], tuple[list[int], list[int], list[int]]
     ] = merge_contiguous_offsets,
+    local_num_blocks: int | None = None,
+    remote_ref_blocks: int | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
     # A shorter (or empty) local list is the READ-mode "drop the transfer, just
     # free the prefill blocks" case (full-prefix-hit / aborted-before-scheduled):
@@ -361,6 +380,36 @@ def compute_block_transfer_offsets(
     element_size = kv_cache.element_size()
     transfer_size_byte = geometry.block_len
     per_block = geometry.transfers_per_block
+
+    # GLM53_INDEXER_KBPB: expand GROUP block-ids into kernel sub-blocks for the
+    # finely-paged single-region DSA sparse-indexer k_cache. Per-side because
+    # local/remote kernel-page counts differ but share the group ratio. kbpb==1
+    # (every 1:1 layer) leaves the id lists and all downstream offsets identical.
+    if per_block == 1:
+        _lk = _kernel_blocks_per_group_block(geometry.num_blocks, local_num_blocks)
+        _rk = _kernel_blocks_per_group_block(remote_num_blocks, remote_ref_blocks)
+        # GLM53_INDEXER_KBPB: the peer advertises ONLY its GROUP-block scalar
+        # (remote_num_blocks == remote_ref_blocks), so _rk cannot be derived
+        # from it and comes back 1 even for the finely-paged DSA indexer.
+        # In symmetric EP8/EP8 both legs run the identical model, so the
+        # kernel-blocks-per-group ratio is a MODEL CONSTANT (kbpb=17), the
+        # SAME on both sides regardless of each leg's group-block budget.
+        # Mirror the side that DID resolve a >1 ratio onto the side that
+        # didn't, so local (17N) and remote (17N) id lists stay aligned in
+        # the zip. (Without this remote stays N -> misaligned past block 0.)
+        if _lk > 1 and _rk <= 1:
+            _rk = _lk
+        elif _rk > 1 and _lk <= 1:
+            _lk = _rk
+        if _lk > 1 or _rk > 1:
+            if os.environ.get('MORIIO_OFFSET_DBG') == '1':
+                print('[GLM53_INDEXER_KBPB] L={} lkbpb={} rkbpb={} nb={} lref={} rnb={} rref={}'
+                      .format(layer_name, _lk, _rk, geometry.num_blocks,
+                              local_num_blocks, remote_num_blocks, remote_ref_blocks),
+                      flush=True)
+            local_block_ids = [lb * _lk + j for lb in local_block_ids for j in range(_lk)]
+            remote_block_ids = [rb * _rk + j for rb in remote_block_ids for j in range(_rk)]
+
     total = len(local_block_ids) * per_block
     offset_local = [0] * total
     offset_remote = [0] * total
