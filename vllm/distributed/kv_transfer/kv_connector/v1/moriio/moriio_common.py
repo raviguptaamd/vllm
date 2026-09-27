@@ -126,6 +126,13 @@ class MoRIIOAgentMetadata(
     num_blocks: int
     block_len: int
     attn_backend_name: str
+    # GLM53_PERGROUP_REMOTE_BLOCKS: per-layer remote kernel-block counts. Hybrid models page
+    # each KV group differently (the DSA sparse-indexer k_cache is paged kbpb x
+    # finer than the shared group-block unit), so the scalar num_blocks above is
+    # only correct for the first layer. OPTIONAL (default {}) -> old peers that
+    # omit it still deserialize; new peers advertise the true per-layer counts so
+    # the consumer computes remote kbpb correctly even under asymmetric topology.
+    layer_num_blocks: dict[str, int] = {}
 
 
 class RoleManager:
