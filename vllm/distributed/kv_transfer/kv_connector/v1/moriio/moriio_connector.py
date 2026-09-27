@@ -798,14 +798,34 @@ class MoRIIOConnectorScheduler:
                             local_block_ids = self.get_exchange_clipped_blocks(
                                 blocks.get_block_ids()
                             )
-                            # Partial cache hits can lead to fewer local blocks vs
-                            # remote blocks, but never more
-                            assert all(
-                                len(local) <= len(remote)
-                                for local, remote in zip(
-                                    local_block_ids, remote_block_ids, strict=True
-                                )
+                            # GLM53_MTP_ALLOC_RECONCILE
+                            # Reconcile the consumer pull-list to exactly
+                            # what the producer holds. MTP makes the decode
+                            # leg (a) enumerate a different KV-group count and
+                            # (b) reserve an extra spec-token block in a shared
+                            # group, so len(local) can exceed len(remote) both
+                            # per-group-count and per-block. Pair only the
+                            # common leading groups and clip each local group to
+                            # its remote length: drops MTP-only trailing group(s)
+                            # and the locally-computed spec block; transfers just
+                            # the prompt KV. GUARD: no-MTP -> counts equal and
+                            # local<=remote already, so this is identity.
+                            _n_common = min(
+                                len(local_block_ids), len(remote_block_ids)
                             )
+                            if os.environ.get('GLM53_MTP_DBG') == '1':
+                                print('[GLM53_MTP_ALLOC_RECONCILE] groups local={} remote={} per_group_len={}'
+                                      .format(len(local_block_ids), len(remote_block_ids),
+                                              [(len(l), len(r)) for l, r in
+                                               zip(local_block_ids, remote_block_ids)]),
+                                      flush=True)
+                            local_block_ids = [
+                                local[:len(remote)]
+                                for local, remote in zip(
+                                    local_block_ids[:_n_common],
+                                    remote_block_ids[:_n_common],
+                                )
+                            ]
                         else:
                             # If remote_blocks and num_external_tokens = 0, we have
                             # a full prefix cache hit on the D worker. We need to call
@@ -1527,7 +1547,20 @@ class MoRIIOConnectorWorker:
     def _get_built_session(self, remote_engine_id):
         if remote_engine_id not in self.built_write_session:
             cur_remote_engine_sessions = []
+            _remote_layer_meta = self.layer_name_to_remote_kv_cache_metadata.get(
+                remote_engine_id, {}
+            )
             for ln, local_meta in self.layer_name_to_local_kv_cache_metadata.items():
+                # GLM53_MTP_ALLOC_RECONCILE: skip MTP-only local layers (e.g. the
+                # Glm5NextMTP draft layer) that the prefill producer never
+                # registered -> no remote KV metadata to pair. Their KV is
+                # produced locally at decode, nothing to transfer. GUARD:
+                # no-MTP -> every local layer has a remote entry -> no-op.
+                if ln not in _remote_layer_meta:
+                    if os.environ.get('GLM53_MTP_DBG') == '1':
+                        print('[GLM53_MTP_ALLOC_RECONCILE] skip session-build for MTP-only layer',
+                              ln, flush=True)
+                    continue
                 unpacked_local_memory_meta = (
                     self.moriio_wrapper.get_unpack_memory_metadata(local_meta[0])
                 )
@@ -2976,11 +3009,32 @@ class MoRIIOConnectorWorker:
 
         # SQ-full backpressure deadline, shared across this request's layers.
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        # GLM53_MTP_ALLOC_RECONCILE: transferable layers = local layers that have a
+        # remote (prefill) counterpart, in order. MTP-only layers were
+        # dropped from the built session list (edit 4), so index sess_idx
+        # over THIS filtered order. GUARD: no-MTP -> == all local layers.
+        _remote_layer_meta = self.layer_name_to_remote_kv_cache_metadata.get(
+            remote_dp_engine_id, {}
+        )
+        _xfer_layers = [
+            _ln for _ln in self.layer_name_to_local_kv_cache_metadata
+            if _ln in _remote_layer_meta
+        ] if _remote_layer_meta else list(
+            self.layer_name_to_local_kv_cache_metadata
+        )
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
-            sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
-                layer_name
-            )
+            # GLM53_MTP_ALLOC_RECONCILE: skip MTP-only layers (no remote KV to READ).
+            if _remote_layer_meta and layer_name not in _remote_layer_meta:
+                continue
+            sess_idx = _xfer_layers.index(layer_name)
             group_idx = self.layer_to_group[layer_name]
+            # GLM53_MTP_ALLOC_RECONCILE: skip MTP-only trailing KV group(s) with no
+            # remote (prefill) counterpart -- KV generated locally, nothing
+            # to READ. GUARD: no-MTP -> group_idx always in range -> no-op.
+            if group_idx >= len(remote_block_ids) or group_idx >= len(
+                local_block_ids
+            ):
+                continue
             offs = self._compute_block_transfer_offsets(
                 layer_name,
                 local_block_ids[group_idx],
