@@ -370,10 +370,12 @@ def compute_block_transfer_offsets(
     # only what decode allocated and an empty local is a no-op. A longer local
     # list is a genuine bug and still fails loudly.
     if len(local_block_ids) > len(remote_block_ids):
-        raise ValueError(
-            "local_block_ids longer than remote_block_ids: "
-            f"{len(local_block_ids)} > {len(remote_block_ids)}"
-        )
+        # GLM53_MTP_ALLOC_RECONCILE: under MTP the decode leg can hold one extra
+        # spec-token block in a group the prefill never produced. Clip the
+        # local pull-list to the remote length (transfer only prompt KV,
+        # size the offset arrays correctly) instead of raising. GUARD:
+        # no-MTP -> local<=remote -> this branch never taken.
+        local_block_ids = local_block_ids[:len(remote_block_ids)]
     geometry = get_layer_transfer_geometry(
         layer_name, kv_cache, layer_to_spec, remote_num_blocks
     )
