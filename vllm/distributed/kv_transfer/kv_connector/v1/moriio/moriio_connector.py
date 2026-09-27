@@ -2889,6 +2889,11 @@ class MoRIIOConnectorWorker:
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
             ),
+            # GLM53_INDEXER_KBPB_CONNECTOR: GROUP-block reference counts so the layout can
+            # expand the finely-paged DSA indexer k_cache group ids into their
+            # kbpb kernel sub-blocks. kbpb==1 for all 1:1 layers (no-op).
+            local_num_blocks=self.num_blocks,
+            remote_ref_blocks=remote_moriio_meta.num_blocks,
         )
         if self.kv_layer_mr_offset:
             local_off = self.kv_layer_mr_offset[layer_name]
