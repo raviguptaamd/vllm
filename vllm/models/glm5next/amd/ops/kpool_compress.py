@@ -830,7 +830,12 @@ def _expand_pools_and_append_tail_kernel(
 ):
     # Fuses expand_pools_to_tokens + append_tail_to_topk (identity path) into a
     # single kernel. Each program writes one (row, column-tile) of the output.
-    row = tl.program_id(0)
+    # patch16: widen the per-row base index to int64 at the offset site so the
+    # row*stride base (both the pool_ids read and the out store) can never wrap
+    # past 2^31 at long context. Mirrors patch15's decode-MQA idiom: int64 on the
+    # row/page index, int32 on the inner column tile. Zero-extend is numerically
+    # identical (row, strides >= 0).
+    row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     cols = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
     mask = cols < out_cols
