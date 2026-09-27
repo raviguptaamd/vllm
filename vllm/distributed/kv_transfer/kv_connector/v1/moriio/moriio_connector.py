@@ -2400,20 +2400,19 @@ class MoRIIOConnectorWorker:
                     base_addr_idx += 1
                 continue
             geometry = self._get_layer_transfer_geometry(layer_name)
-            if hma_enabled:
-                if geometry.block_len != self.block_len:
-                    raise ValueError(
-                        "MoRIIO KV cache block length mismatch for layer "
-                        f"{layer_name}: {geometry.block_len} != {self.block_len}"
-                    )
-            elif geometry.block_size != self.block_size:
+            # GLM53_HYBRID_LAYER_GEOMETRY: under the hybrid KV cache manager the
+            # attention layers legitimately differ in block_len (e.g. GLM-5.3's
+            # MLA latent page vs. its paged DSA indexer cache); transfer sizes and
+            # strides are per layer, so only the non-hybrid path checks block_size.
+            if not hma_enabled and geometry.block_size != self.block_size:
                 raise ValueError(
                     "MoRIIO KV cache block size mismatch for layer "
                     f"{layer_name}: {geometry.block_size} != {self.block_size}"
                 )
-            # num_blocks is advertised as a single scalar to the peer, so must it
-            # be uniform
-            if geometry.num_blocks != self.num_blocks:
+            # The scalar num_blocks advertised to the peer is only consumed by the
+            # split-K/V path (remote_kv_stride); single-region layers use their own
+            # advertised count (layer_num_blocks).
+            if geometry.transfers_per_block == 2 and geometry.num_blocks != self.num_blocks:
                 raise ValueError(
                     "MoRIIO KV cache num_blocks mismatch for layer "
                     f"{layer_name}: {geometry.num_blocks} != {self.num_blocks}"
