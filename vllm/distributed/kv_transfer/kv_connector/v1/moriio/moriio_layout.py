@@ -315,6 +315,33 @@ def get_layer_transfer_geometry(
             split_kv_regions=False,
         )
 
+    if (
+        isinstance(spec, AttentionSpec)
+        and len(shape) == 4
+        and shape[1] == spec.num_heads
+        and shape[2] < spec.num_states
+        and spec.num_states % shape[2] == 0
+        and shape[3] * element_size == spec.state_content_size_bytes
+    ):
+        # GLM53_INDEXER_KERNEL_PAGES: the kpool DSA indexer cache is stored in
+        # kernel pages that are finer than the KV block (one block spans
+        # num_states // shape[2] pages). Describe one page here; the group
+        # block ids are expanded into page ids in compute_block_transfer_offsets.
+        num_blocks, num_heads, page_states, content_dim = shape
+        slot_size_bytes = num_heads * content_dim * element_size
+        return LayerTransferGeometry(
+            num_blocks=num_blocks,
+            block_size=spec.block_size * page_states // spec.num_states,
+            block_len=page_states * slot_size_bytes,
+            slot_size_bytes=slot_size_bytes,
+            block_stride=stride[0],
+            local_kv_stride=None,
+            remote_kv_stride=None,
+            transfers_per_block=1,
+            regions_per_block=1,
+            split_kv_regions=False,
+        )
+
     cache_kind = "MLA" if is_mla_cache else "K/V"
     raise ValueError(
         f"Unsupported MoRIIO {cache_kind} cache shape for layer "
