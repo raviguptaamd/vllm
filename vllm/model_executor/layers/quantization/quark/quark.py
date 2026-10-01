@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import fnmatch
+import os
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import torch
@@ -738,6 +739,19 @@ class QuarkConfig(QuantizationConfig):
                     "weight-only quantization."
                 )
             activation_quant_key = _ACTIVATION_QUANT_KEY_MAP[input_dtype]
+            if (
+                os.environ.get("VLLM_ROCM_MXFP4_WEIGHT_ONLY", "0") == "1"
+                and not current_platform.supports_mx()
+            ):
+                # GLM53_MXFP4_W4A16_ON_GFX942: without MX matrix cores the OCP MX
+                # activation path is emulated; run the checkpoint weight-only
+                # (W4A16) so MoE selects a native W4A16 kernel.
+                logger.info_once(
+                    "VLLM_ROCM_MXFP4_WEIGHT_ONLY=1: running %s activations "
+                    "unquantized (W4A16) on a platform without MX support.",
+                    input_dtype,
+                )
+                activation_quant_key = None
         return QuantKeyMatch(True, activation_quant_key, weight_quant_key)
 
     @staticmethod

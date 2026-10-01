@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from functools import partial
 
@@ -98,6 +99,15 @@ class EmulationMxfp4LinearKernel(MxFp4LinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
+        if (
+            self.config.activation_quant_key is None
+            and os.environ.get("VLLM_ROCM_MXFP4_WEIGHT_ONLY", "0") == "1"
+            and not current_platform.supports_mx()
+        ):
+            # Weight-only without MX support: dequantize once instead of per forward.
+            dq_w = dequant_mxfp4(layer.weight, layer.weight_scale, torch.bfloat16)
+            layer.weight = Parameter(dq_w, requires_grad=False)
+            layer.mxfp4_dequantized = True
 
     def apply_weights(
         self,
@@ -105,6 +115,10 @@ class EmulationMxfp4LinearKernel(MxFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "mxfp4_dequantized", False):
+            if layer.weight.dtype != x.dtype:
+                layer.weight = Parameter(layer.weight.data.to(x.dtype), requires_grad=False)
+            return F.linear(x, layer.weight, bias)
         dq_w = dequant_mxfp4(layer.weight, layer.weight_scale, x.dtype)
         qdq_x = self.quant_dequant_func(x)
         return F.linear(qdq_x, dq_w, bias)
