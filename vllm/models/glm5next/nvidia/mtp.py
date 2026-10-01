@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import re
 import typing
 from collections.abc import Callable, Iterable
 
@@ -210,22 +209,16 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
     # Resolve per-layer quant configs (checkpoint names) against the drafter's
-    # module names: layer-level head weights sit at model.layers.N.<name>, the
-    # rest of the layer under model.layers.N.mtp_block.
+    # module names (model.layers.N...; the checkpoint nests them under the
+    # language model).
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_regex={
-            re.compile(
-                r"^(?:model\.language_model|language_model\.model)\.layers\.(\d+)\."
-                r"(embed_tokens|enorm|hnorm|eh_proj|shared_head)"
-            ): r"model.layers.\1.\2",
-            re.compile(
-                r"^(?:model\.language_model|language_model\.model)\.layers\.(\d+)\."
-                r"(?!(?:embed_tokens|enorm|hnorm|eh_proj|shared_head))"
-            ): r"model.layers.\1.mtp_block.",
+        orig_to_new_prefix={
+            "model.language_model.layers.": "model.layers.",
+            "language_model.model.layers.": "model.layers.",
         }
     )
 

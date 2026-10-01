@@ -1273,16 +1273,22 @@ def _try_load_fp8_attn_proj(
         return False
     suffix, (key, target_base, shard_id, is_kva) = matched
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
+    # DeepSeek-style FP8 names the block scale weight_scale_inv; Quark per-block
+    # FP8 names the same float32 multiplier weight_scale.
+    is_scale = name.endswith(("weight_scale_inv", ".weight_scale")) and (
+        tensor.dtype == torch.float32
+    )
     if not is_weight and not is_scale:
         return False
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
-    target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
     # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    # handle it (it has a block-scale param).
+    if any(
+        f"{layer_prefix}.{target_base}.{scale_name}" in params_dict
+        for scale_name in ("weight_scale_inv", "weight_scale")
+    ):
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
