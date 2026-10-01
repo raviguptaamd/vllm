@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import re
 import typing
 from collections.abc import Callable, Iterable
 
@@ -21,7 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -208,6 +209,26 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    # Resolve per-layer quant configs (checkpoint names) against the drafter's
+    # module names: layer-level head weights sit at model.layers.N.<name>, the
+    # rest of the layer under model.layers.N.mtp_block.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            re.compile(
+                r"^(?:model\.language_model|language_model\.model)\.layers\.(\d+)\."
+                r"(embed_tokens|enorm|hnorm|eh_proj|shared_head)"
+            ): r"model.layers.\1.\2",
+            re.compile(
+                r"^(?:model\.language_model|language_model\.model)\.layers\.(\d+)\."
+                r"(?!(?:embed_tokens|enorm|hnorm|eh_proj|shared_head))"
+            ): r"model.layers.\1.mtp_block.",
+        }
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config

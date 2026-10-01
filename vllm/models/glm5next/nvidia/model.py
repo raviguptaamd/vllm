@@ -1040,6 +1040,16 @@ class Glm5NextForConditionalGeneration(
     has_inner_state: ClassVar[Literal[True]] = True
     is_hybrid: ClassVar[Literal[True]] = True
 
+    # Glm4v's mapping treats gate_up_proj as a single checkpoint tensor; here the
+    # checkpoint stores gate_proj / up_proj (text and vision) and q_a_proj /
+    # kv_a_proj_with_mqa separately, so per-layer quant configs must resolve via
+    # these shards (e.g. FP8 dense / MLA layers in a MXFP4 Quark checkpoint).
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
     # (``model.visual.`` -> ``visual.``, ``model.language_model.`` ->
     # ``language_model.model.``, ``lm_head.`` -> ``language_model.lm_head.``),
