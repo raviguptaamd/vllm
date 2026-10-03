@@ -2952,6 +2952,8 @@ class MoRIIOConnectorWorker:
         Returns:
             Tuple of (local_offsets, remote_offsets, transfer_sizes)
         """
+        # Under the KDA fan-in every non-Mamba cache (MLA latent, DSA indexer, kpool
+        # tail) is single-head and replicated across prefill TP ranks.
         validate_moriio_heterogeneous_tp_kv_heads(
             local_tp_size=self.world_size,
             remote_tp_size=(
@@ -2960,7 +2962,7 @@ class MoRIIOConnectorWorker:
                 else self.world_size
             ),
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
-            is_mla=self._is_mla_cache_layer(layer_name),
+            is_mla=self._is_mla_cache_layer(layer_name) or _GLM53_HETERO_TP_FANIN,
         )
         local, remote, sizes = compute_block_transfer_offsets(
             layer_name=layer_name,
