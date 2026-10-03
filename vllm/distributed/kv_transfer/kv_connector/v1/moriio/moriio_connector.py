@@ -3046,15 +3046,19 @@ class MoRIIOConnectorWorker:
         local_base = (
             self.kv_layer_mr_offset.get(layer_name, 0) if self.kv_layer_mr_offset else 0
         )
+        logger.info_once(
+            "GLM53_HETERO_TP_FANIN: KDA fan-in from %d prefill TP ranks: conv section "
+            "%d B -> %d B/rank, recurrent %d B -> %d B/rank, block stride %d B",
+            remote_tp_size,
+            sec,
+            sec_r,
+            rec_bytes,
+            rec_r,
+            stride,
+        )
         for t in range(remote_tp_size):
             engine = self.get_engine_name_with_dp_tp(dst_engine_id, remote_dp_rank, t)
             sessions, meta = self._get_built_session(engine)
-            if meta.block_len and meta.block_len * remote_tp_size != geometry.block_len:
-                raise RuntimeError(
-                    f"GLM53_HETERO_TP_FANIN: remote KDA block_len {meta.block_len} x "
-                    f"tp {remote_tp_size} != local {geometry.block_len}; the legs must "
-                    "run the same --block-size and conv state layout"
-                )
             remote_base = self._remote_layer_mr_offset(layer_name, meta, engine)
             loc: list[int] = []
             rem: list[int] = []
