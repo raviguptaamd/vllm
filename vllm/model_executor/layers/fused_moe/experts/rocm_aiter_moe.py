@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+    mxfp4_fp4lut_enabled,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -393,6 +396,8 @@ def rocm_aiter_fused_experts(
                 if rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
                 else GateMode.SEPARATED.value
             )
+        elif quant_config.use_mxfp4_w4a16 and mxfp4_fp4lut_enabled():
+            gate_mode = GateMode.SEPARATED.value
         elif quant_config.use_mxfp4_w4a16:
             gate_mode = GateMode.INTERLEAVE.value
         elif activation_interleave is not None:
@@ -495,8 +500,10 @@ class AiterExperts(mk.FusedMoEExpertsModular):
         if (weight_key, activation_key) not in SUPPORTED_W_A:
             return False
         if weight_key == kMxfp4Static:
-            from vllm.platforms.rocm import on_gfx950, on_gfx1250
+            from vllm.platforms.rocm import on_gfx942, on_gfx950, on_gfx1250
 
+            if on_gfx942() and activation_key is None and mxfp4_fp4lut_enabled():
+                return True
             if not on_gfx950() or on_gfx1250():
                 return False
         return True

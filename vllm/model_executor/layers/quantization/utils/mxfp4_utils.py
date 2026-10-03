@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -11,6 +12,53 @@ from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
 
 logger = init_logger(__name__)
+
+
+def mxfp4_fp4lut_enabled() -> bool:
+    """MXFP4 MoE weights run on AITER's FlyDSL W4A16 kernel with exact e2m1 decode.
+
+    The same variable switches AITER's in-kernel nibble decode from int4 to e2m1, so the
+    weight layout written by convert_mxfp4_to_fp4lut and the kernel always agree.
+    """
+    return os.environ.get("AITER_FLYDSL_W4_FP4", "0") == "1"
+
+
+def convert_mxfp4_to_fp4lut(
+    weight: torch.Tensor, scale: torch.Tensor, chunk: int = 8
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """OCP MXFP4 experts ([E, N, K/2] packed e2m1, [E, N, K/32] e8m0) -> FlyDSL W4A16 layout.
+
+    The e2m1 codes go through the int4 preshuffle/pack unchanged; the scale becomes
+    2^(e - 127) / 2 in bf16, laid out [E, K/32, N], because the kernel decodes 2 * value.
+    """
+    from aiter import dtypes as aiter_dtypes
+    from aiter.ops.shuffle import (
+        pack_int8_to_packed_int4,
+        shuffle_scale_for_int4,
+        shuffle_weight,
+    )
+
+    w = weight.data.view(torch.uint8)
+    s = scale.data.view(torch.uint8)
+    num_experts, n, k_half = w.shape
+    out_w = torch.empty((num_experts, n, k_half), dtype=torch.uint8, device=w.device)
+    out_s: torch.Tensor | None = None
+    for lo in range(0, num_experts, chunk):
+        hi = min(lo + chunk, num_experts)
+        wc = w[lo:hi]
+        codes = torch.stack((wc & 0xF, wc >> 4), dim=-1).view(hi - lo, n, k_half * 2)
+        packed = pack_int8_to_packed_int4(shuffle_weight(codes.to(torch.int8), (16, 16)))
+        out_w[lo:hi].copy_(packed.view(hi - lo, n, k_half).view(torch.uint8))
+        sc = torch.exp2(s[lo:hi].float() - 128.0).transpose(-1, -2).contiguous()
+        sc = shuffle_scale_for_int4(sc.to(torch.bfloat16), group_size=32)
+        if out_s is None:
+            out_s = torch.empty(
+                (num_experts,) + tuple(sc.shape[1:]), dtype=sc.dtype, device=sc.device
+            )
+        out_s[lo:hi].copy_(sc)
+        del codes, packed, sc
+    assert out_s is not None
+    return out_w.view(aiter_dtypes.i4x2), out_s.view(-1).contiguous()
 
 
 def should_use_cdna4_mx_scale_swizzle() -> bool:

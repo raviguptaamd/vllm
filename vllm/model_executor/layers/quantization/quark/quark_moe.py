@@ -87,6 +87,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+    convert_mxfp4_to_fp4lut,
+    mxfp4_fp4lut_enabled,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -1289,6 +1293,14 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             get_current_vllm_config().model_config.hf_config, "model_type", None
         )
 
+        from vllm.platforms.rocm import on_gfx942
+
+        self.fp4lut = (
+            self.ocp_mx_scheme == "w_mxfp4" and on_gfx942() and mxfp4_fp4lut_enabled()
+        )
+        if self.fp4lut:
+            self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_BF16
+
         # If no native backend available, use emulation.
         if self.mxfp4_backend is Mxfp4MoeBackend.NONE:
             self.mxfp4_backend = Mxfp4MoeBackend.EMULATION
@@ -1446,6 +1458,10 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
+        if self.fp4lut:
+            self._setup_kernel_fp4lut(layer)
+            return
+
         # Convert weights to kernel format (handles all backend-specific logic)
         w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
             convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
@@ -1496,6 +1512,33 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 routing_tables=layer._expert_routing_tables(),
             )
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+    def _setup_kernel_fp4lut(self, layer: RoutedExperts) -> None:
+        # Convert one tensor at a time so only one source is live next to its output.
+        for name in ("w13", "w2"):
+            w, s = convert_mxfp4_to_fp4lut(
+                getattr(layer, f"{name}_weight"), getattr(layer, f"{name}_weight_scale")
+            )
+            replace_parameter(layer, f"{name}_weight", w)
+            replace_parameter(layer, f"{name}_weight_scale", s)
+            del w, s
+            torch.accelerator.empty_cache()
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
+        logger.info_once(
+            "MXFP4 MoE experts on AITER FlyDSL W4A16 with exact e2m1 decode (gfx942)."
+        )
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None and self.experts_cls is not None
+        self.moe_kernel = make_mxfp4_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            mxfp4_backend=self.mxfp4_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+        )
+        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
