@@ -215,6 +215,20 @@ def _fill_short_decode_causal_indices(
     return True
 
 
+def _causal_rows_for_short_decode(
+    topk_rows: torch.Tensor, positions: torch.Tensor, topk_tokens: int
+) -> torch.Tensor:
+    """GLM53_SHORT_DECODE_CAUSAL_ROWS: rows whose sequence fits in topk_tokens
+    select every causal token. The sparse top-k does not guarantee that for
+    them (fewer valid pools than selected slots), and the host-side all-short
+    shortcut is skipped for mixed batches and frozen under FULL cudagraphs."""
+    pos = positions.to(torch.int32)
+    cols = torch.arange(topk_rows.shape[-1], device=topk_rows.device, dtype=torch.int32)
+    causal = torch.where(cols[None, :] <= pos[:, None], cols[None, :], -1)
+    short = (pos + 1 <= topk_tokens)[:, None]
+    return torch.where(short, causal.to(topk_rows.dtype), topk_rows)
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -899,6 +913,8 @@ def sparse_attn_indexer_kpool(
             out = unpack_seq_triton(
                 out.reshape(batch_size, -1, out.shape[-1]), decode_lens
             )
+        if positions is not None:
+            out = _causal_rows_for_short_decode(out, positions[: out.shape[0]], topk_tokens)
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
     return topk_indices_buffer
