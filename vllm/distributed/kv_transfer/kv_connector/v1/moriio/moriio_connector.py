@@ -91,6 +91,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_GLM53_HETERO_TP_FANIN = os.environ.get("GLM53_HETERO_TP_FANIN", "0") == "1"
+
 
 try:
     from mori.io import (
@@ -1448,6 +1450,9 @@ class MoRIIOConnectorWorker:
         # Used by _pop_done_transfers to abort transfers whose RDMA
         # completion is lost, instead of hanging forever.
         self._recving_transfers_start: dict[str, float] = {}
+        # Fan-in reads touch every prefill TP rank; each one must get the release
+        # (the prefill engine frees blocks only when all its workers report).
+        self._recving_transfers_extra_notify: dict[ReqId, list[tuple[str, str]]] = {}
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -2312,13 +2317,16 @@ class MoRIIOConnectorWorker:
                 if statuses and all(status.Succeeded() for status in statuses):
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
-                    self.moriio_wrapper.send_notify(
-                        xfer_id,
-                        host,
-                        port,
-                        message_type="release",
-                        message_fields={"consumer_tp_size": self.world_size},
-                    )
+                    for n_host, n_port in [(host, port)] + (
+                        self._recving_transfers_extra_notify.get(req_id, [])
+                    ):
+                        self.moriio_wrapper.send_notify(
+                            xfer_id,
+                            n_host,
+                            n_port,
+                            message_type="release",
+                            message_fields={"consumer_tp_size": self.world_size},
+                        )
                     to_remove.append(req_id)
                 elif failed_status is not None:
                     logger.error(
@@ -2331,13 +2339,16 @@ class MoRIIOConnectorWorker:
                     )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
-                        self.moriio_wrapper.send_notify(
-                            xfer_id,
-                            host,
-                            port,
-                            message_type="release",
-                            message_fields={"consumer_tp_size": self.world_size},
-                        )
+                        for n_host, n_port in [(host, port)] + (
+                            self._recving_transfers_extra_notify.get(req_id, [])
+                        ):
+                            self.moriio_wrapper.send_notify(
+                                xfer_id,
+                                n_host,
+                                n_port,
+                                message_type="release",
+                                message_fields={"consumer_tp_size": self.world_size},
+                            )
                     except Exception:
                         logger.exception(
                             "Failed to send error notification for request %s",
@@ -2365,6 +2376,7 @@ class MoRIIOConnectorWorker:
                 del self._recving_transfers[req_id]
                 del self._recving_transfers_callback_addr[req_id]
                 self._recving_transfers_start.pop(req_id, None)
+                self._recving_transfers_extra_notify.pop(req_id, None)
 
             return done_req_ids
 
@@ -2515,9 +2527,8 @@ class MoRIIOConnectorWorker:
             # that the eager barrier keeps everyone in step for.
             flexible = (
                 self.world_size == 1
-                and self.use_mla
-                and remote_dp_size == 1
                 and tp_size > 1
+                and (_GLM53_HETERO_TP_FANIN or (self.use_mla and remote_dp_size == 1))
             )
             # (engine_id, dp_rank, tp_rank_or_None); tp_rank is None on the legacy
             # path so _moriio_handshake falls back to its _remote_tp_rank mapping.
@@ -2771,9 +2782,11 @@ class MoRIIOConnectorWorker:
         remote_tp_size = int(meta.tp_size)
         flexible = (
             self.world_size == 1
-            and self.use_mla
-            and int(meta.remote_dp_size) == 1
             and remote_tp_size > 1
+            and (
+                _GLM53_HETERO_TP_FANIN
+                or (self.use_mla and int(meta.remote_dp_size) == 1)
+            )
         )
         if flexible:
             chosen_tp = self._next_flex_tp_rank(remote_tp_size)
@@ -2995,6 +3008,79 @@ class MoRIIOConnectorWorker:
         except Exception:
             return False
 
+    def _is_mamba_layer(self, layer_name: str) -> bool:
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        return isinstance(self.layer_to_spec.get(layer_name), MambaSpec)
+
+    def _read_kda_fanin(
+        self,
+        layer_name: str,
+        sess_idx: int,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        dst_engine_id: str,
+        remote_dp_rank: int,
+        remote_tp_size: int,
+        request_id: str,
+        sq_deadline: float,
+    ) -> None:
+        """Read one KDA layer's head-sharded state from every prefill TP rank.
+
+        Page layout on both legs: [conv q|k|v (DS, dim-first)][recurrent (H, d, d)];
+        a prefill TP rank holds 1/tp of each conv section and of the heads, packed at
+        the start of the same-stride page (both legs run the same attention block size).
+        """
+        import math
+
+        from vllm.utils.torch_utils import get_dtype_size
+
+        spec = self.layer_to_spec[layer_name]
+        conv_bytes, rec_bytes = (
+            math.prod(s) * get_dtype_size(d) for s, d in zip(spec.shapes, spec.dtypes)
+        )
+        sec = conv_bytes // 3
+        sec_r, rec_r = sec // remote_tp_size, rec_bytes // remote_tp_size
+        geometry = self._get_layer_transfer_geometry(layer_name)
+        stride = geometry.block_stride * self.kv_caches[layer_name].element_size()
+        local_base = (
+            self.kv_layer_mr_offset.get(layer_name, 0) if self.kv_layer_mr_offset else 0
+        )
+        for t in range(remote_tp_size):
+            engine = self.get_engine_name_with_dp_tp(dst_engine_id, remote_dp_rank, t)
+            sessions, meta = self._get_built_session(engine)
+            if meta.block_len and meta.block_len * remote_tp_size != geometry.block_len:
+                raise RuntimeError(
+                    f"GLM53_HETERO_TP_FANIN: remote KDA block_len {meta.block_len} x "
+                    f"tp {remote_tp_size} != local {geometry.block_len}; the legs must "
+                    "run the same --block-size and conv state layout"
+                )
+            remote_base = self._remote_layer_mr_offset(layer_name, meta, engine)
+            loc: list[int] = []
+            rem: list[int] = []
+            siz: list[int] = []
+            for lb, rb in zip(local_block_ids, remote_block_ids):
+                l0, r0 = local_base + lb * stride, remote_base + rb * stride
+                for k in range(3):
+                    loc.append(l0 + k * sec + t * sec_r)
+                    rem.append(r0 + k * sec_r)
+                    siz.append(sec_r)
+                loc.append(l0 + conv_bytes + t * rec_r)
+                rem.append(r0 + 3 * sec_r)
+                siz.append(rec_r)
+            backoff = 0.001
+            while True:
+                status = self.moriio_wrapper.read_remote_data(
+                    siz, loc, rem, sessions[sess_idx]
+                )
+                if not self._is_sq_full_status(status) or time.monotonic() > sq_deadline:
+                    break
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 0.05)
+            with self.moriio_wrapper.lock:
+                self._recving_transfers[request_id][f"{layer_name}#tp{t}"] = status
+                self._recving_transfers_start.setdefault(request_id, time.monotonic())
+
     def _read_blocks(
         self,
         local_block_ids: BlockIds,
@@ -3036,6 +3122,22 @@ class MoRIIOConnectorWorker:
                 dst_engine_id, int(remote_dp_rank)
             )
         sessions, remote_moriio_meta = self._get_built_session(remote_dp_engine_id)
+        # GLM53_HETERO_TP_FANIN: TP prefill -> TP1 decode for hybrid models. Replicated
+        # caches (MLA latent, indexer, kpool tail) come from eff_tp; head-sharded
+        # Mamba/KDA state is read from every prefill TP rank into its head slice.
+        fanin = flexible and _GLM53_HETERO_TP_FANIN and int(remote_tp_size) > 1
+        if fanin:
+            self._recving_transfers_extra_notify[request_id] = [
+                (
+                    remote_host,
+                    str(
+                        remote_notify_port
+                        + get_port_offset(int(remote_dp_rank), t, remote_tp_size)
+                    ),
+                )
+                for t in range(int(remote_tp_size))
+                if t != eff_tp
+            ]
 
         # SQ-full backpressure deadline, shared across this request's layers.
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
@@ -3064,6 +3166,19 @@ class MoRIIOConnectorWorker:
             if group_idx >= len(remote_block_ids) or group_idx >= len(
                 local_block_ids
             ):
+                continue
+            if fanin and self._is_mamba_layer(layer_name):
+                self._read_kda_fanin(
+                    layer_name,
+                    sess_idx,
+                    local_block_ids[group_idx],
+                    remote_block_ids[group_idx],
+                    dst_engine_id,
+                    int(remote_dp_rank),
+                    int(remote_tp_size),
+                    request_id,
+                    _sq_deadline,
+                )
                 continue
             offs = self._compute_block_transfer_offsets(
                 layer_name,
