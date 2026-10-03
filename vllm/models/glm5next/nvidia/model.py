@@ -350,11 +350,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         else:
+            # GLM53_SP_DENSE_MLP: in SP each TP rank holds a different token shard
+            # here, so a TP-sharded dense MLP would all-reduce across different
+            # tokens; replicate its weights instead (as for the shared experts).
             self.mlp = Glm5NextMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                is_sequence_parallel=self.is_sequence_parallel and not is_mtp_layer,
                 prefix=f"{prefix}.mlp",
                 swiglu_limit=config.swiglu_limit,
             )
