@@ -61,6 +61,68 @@ def convert_mxfp4_to_fp4lut(
     return out_w.view(aiter_dtypes.i4x2), out_s.view(-1).contiguous()
 
 
+def mxfp4_moe_fp8_block_enabled() -> bool:
+    """MXFP4 (weight-only) MoE experts converted at load to FP8 128x128 blocks.
+
+    gfx942 has no FP4 matrix math; on FP8 blocks the experts run on the FP8 block MoE
+    path (FP8 MFMA, dynamic per-128 FP8 activations) at 8-bit storage.
+    """
+    return os.environ.get("VLLM_ROCM_MXFP4_MOE_FP8BLOCK", "0") == "1"
+
+
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def convert_mxfp4_to_fp8_block(
+    weight: torch.Tensor, scale: torch.Tensor, block: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """OCP MXFP4 experts ([E, N, K/2] packed e2m1, [E, N, K/32] e8m0) -> FP8 e4m3fn
+    [E, N, K] with float32 scales [E, N/block, K/block], bit-exact.
+
+    Each block's scale is 2^(largest group exponent - 5), so the largest value (6 * 2^5)
+    fits e4m3fn and every e2m1 value of a group within 11 binades of it stays an exact
+    e4m3fn value (also after the e4m3fnuz normalization, which halves values and doubles
+    scales). Groups whose codes are all zero do not constrain the block. Raises if a
+    block spans more, and checks every converted value.
+    """
+    w = weight.data.view(torch.uint8)
+    s = scale.data.view(torch.uint8)
+    num_experts, n, k_half = w.shape
+    k = 2 * k_half
+    groups_per_block = block // 32
+    assert n % block == 0 and k % block == 0, (n, k, block)
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=w.device)
+    out_w = torch.empty((num_experts, n, k), dtype=torch.float8_e4m3fn, device=w.device)
+    out_s = torch.empty(
+        (num_experts, n // block, k // block), dtype=torch.float32, device=w.device
+    )
+    for e in range(num_experts):
+        codes = torch.stack((w[e] & 0xF, w[e] >> 4), dim=-1).view(n, k)
+        exp = s[e].to(torch.int32) - 127
+        live = (codes & 0x7).view(n, k // 32, 32).amax(dim=-1) > 0
+        g = exp.view(n // block, block, k // block, groups_per_block)
+        lv = live.view_as(g)
+        big = torch.iinfo(torch.int32).max
+        hi = torch.where(lv, g, -big).amax(dim=(1, 3))
+        lo = torch.where(lv, g, big).amin(dim=(1, 3))
+        spread = torch.where(hi > -big, hi - lo, 0)
+        if int(spread.max()) > 11:
+            raise ValueError(
+                f"MXFP4 expert {e}: a {block}x{block} block spans {int(spread.max())} "
+                "binades of group scales; FP8 block conversion would not be exact."
+            )
+        base = torch.where(hi > -big, hi, 0) - 5
+        rel = exp - base.repeat_interleave(block, 0).repeat_interleave(groups_per_block, 1)
+        rel = torch.where(live, rel, 0)
+        vals = (lut[codes.long()].view(n, k // 32, 32) * torch.exp2(rel.float())[..., None]).view(n, k)
+        out_w[e] = vals.to(torch.float8_e4m3fn)
+        if not torch.equal(out_w[e].float(), vals):
+            raise ValueError(f"MXFP4 expert {e}: FP8 block conversion is not exact.")
+        out_s[e] = torch.exp2(base.float())
+        del codes, exp, live, rel, vals
+    return out_w, out_s
+
+
 def should_use_cdna4_mx_scale_swizzle() -> bool:
     """Whether to use the CDNA4 swizzled scale layout for mxfp4 on gfx950.
 

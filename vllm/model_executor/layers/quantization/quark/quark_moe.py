@@ -89,7 +89,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     convert_mxfp4_to_fp4lut,
+    convert_mxfp4_to_fp8_block,
     mxfp4_fp4lut_enabled,
+    mxfp4_moe_fp8_block_enabled,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
@@ -221,6 +223,10 @@ class QuarkMoEMethod(FusedMoEMethodBase):
                 module.moe_config, weight_quant_key, activation_quant_key
             )
         elif method_cls is QuarkOCP_MX_MoEMethod:
+            if QuarkMxfp4AsFp8BlockMoEMethod.applies(
+                weight_quant_key, activation_quant_key
+            ):
+                return QuarkMxfp4AsFp8BlockMoEMethod(module.moe_config)
             # All OCP MX schemes (W4A16, W4A8, etc.) handled by QuarkOCP_MX_MoEMethod
             # Backend selection happens inside via oracle
             return QuarkOCP_MX_MoEMethod(
@@ -645,6 +651,90 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+
+class QuarkMxfp4AsFp8BlockMoEMethod(QuarkW8A8Fp8MoEMethod):
+    """Weight-only MXFP4 experts run as FP8 128x128 block experts (gfx942).
+
+    Loads the checkpoint's packed e2m1 weights and e8m0 scales, converts them exactly to
+    FP8 blocks after loading, then takes the FP8 block path (dynamic per-128 FP8
+    activations). Enabled by VLLM_ROCM_MXFP4_MOE_FP8BLOCK=1.
+    """
+
+    def __init__(self, moe: FusedMoEConfig):
+        super().__init__(moe, kFp8Static128BlockSym, kFp8Dynamic128Sym)
+
+    @staticmethod
+    def applies(
+        weight_quant_key: QuantKey | None, activation_quant_key: QuantKey | None
+    ) -> bool:
+        from vllm.platforms.rocm import on_gfx942
+
+        return (
+            mxfp4_moe_fp8_block_enabled()
+            and on_gfx942()
+            and weight_quant_key == _WEIGHT_QUANT_KEY_MAP["mxfp4"]
+            and activation_quant_key is None
+        )
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        if self.has_bias:
+            raise NotImplementedError("MXFP4 -> FP8 block experts do not support bias")
+        assert self.weight_block_size is not None
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+        validate_fp8_block_shape_moe(
+            intermediate_size_per_partition, self.weight_block_size
+        )
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+        w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
+        shapes = {
+            "w13_weight": (num_experts, w13_rows, hidden_size // 2),
+            "w2_weight": (num_experts, hidden_size, intermediate_size_per_partition // 2),
+            "w13_weight_scale": (num_experts, w13_rows, hidden_size // OCP_MX_BLOCK_SIZE),
+            "w2_weight_scale": (
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // OCP_MX_BLOCK_SIZE,
+            ),
+        }
+        for name, shape in shapes.items():
+            param = torch.nn.Parameter(
+                torch.zeros(shape, dtype=torch.uint8), requires_grad=False
+            )
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        layer.w13_bias, layer.w2_bias = None, None
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        # Convert one tensor at a time so only one source is live next to its output.
+        for name in ("w13", "w2"):
+            w, s = convert_mxfp4_to_fp8_block(
+                getattr(layer, f"{name}_weight"), getattr(layer, f"{name}_weight_scale")
+            )
+            replace_parameter(layer, f"{name}_weight", w)
+            replace_parameter(layer, f"{name}_weight_scale", s)
+            del w, s
+            torch.accelerator.empty_cache()
+        logger.info_once(
+            "MXFP4 MoE experts converted exactly to FP8 128x128 blocks (gfx942); "
+            "FP8 block MoE backend %s.",
+            self.fp8_backend.value,
+        )
+        super().process_weights_after_loading(layer)
 
 
 class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
