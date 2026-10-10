@@ -38,7 +38,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.platforms import current_platform
 
-__all__ = ["QuarkW8A8Fp8", "QuarkW8A8Fp8PerBlock"]
+__all__ = ["QuarkW8A8Fp8", "QuarkW8A8Fp8PerBlock", "QuarkMxfp4AsFp8PerBlock"]
 
 logger = init_logger(__name__)
 
@@ -309,3 +309,117 @@ class QuarkW8A8Fp8PerBlock(QuarkScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.fp8_linear.apply_weights(layer, x, bias)
+
+
+class QuarkMxfp4AsFp8PerBlock(QuarkW8A8Fp8PerBlock):
+    """Weight-only MXFP4 linear layers run as FP8 128x128 block layers (gfx942).
+
+    Loads the checkpoint's packed e2m1 weight and e8m0 scales, converts them exactly to
+    FP8 blocks after loading, then takes the FP8 per-block linear kernel (dynamic
+    per-128 FP8 activations). Enabled by VLLM_ROCM_MXFP4_DENSE_FP8BLOCK=1.
+    """
+
+    @staticmethod
+    def applies(
+        weight_quant_key: QuantKey | None, activation_quant_key: QuantKey | None
+    ) -> bool:
+        import os
+
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp4Static,
+        )
+        from vllm.platforms.rocm import on_gfx942
+
+        return (
+            os.environ.get("VLLM_ROCM_MXFP4_DENSE_FP8BLOCK", "0") == "1"
+            and on_gfx942()
+            and weight_quant_key == kMxfp4Static
+            and activation_quant_key is None
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        output_partition_sizes: list[int],
+        input_size_per_partition: int,
+        params_dtype: torch.dtype,
+        weight_loader: Callable,
+        **kwargs,
+    ):
+        from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
+            OCP_MX_BLOCK_SIZE,
+        )
+        from vllm.model_executor.parameter import (
+            GroupQuantScaleParameter,
+            PackedvLLMParameter,
+        )
+
+        input_size = kwargs.get("input_size", input_size_per_partition)
+        output_size = kwargs.get("output_size", sum(output_partition_sizes))
+        output_size_per_partition = sum(output_partition_sizes)
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+
+        validate_fp8_block_shape(
+            layer,
+            input_size,
+            output_size,
+            input_size_per_partition,
+            output_partition_sizes,
+            self.weight_block_size,
+        )
+
+        weight = PackedvLLMParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // 2,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            packed_dim=1,
+            packed_factor=2,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        weight_scale = GroupQuantScaleParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+        assert self.activation_quant_key is not None
+        self.fp8_linear = init_fp8_linear_kernel(
+            activation_quant_key=self.activation_quant_key,
+            weight_quant_key=self.weight_quant_key,
+            weight_shape=torch.Size((output_size_per_partition, input_size_per_partition)),
+            input_dtype=self.input_dtype,
+            out_dtype=self.out_dtype,
+            module_name=self.__class__.__name__,
+        )
+        logger.info_once(
+            "Selected %s for QuarkMxfp4AsFp8PerBlock", type(self.fp8_linear).__name__
+        )
+
+    def process_weights_after_loading(self, layer) -> None:
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            convert_mxfp4_to_fp8_block,
+        )
+        from vllm.model_executor.utils import replace_parameter
+
+        w, s = convert_mxfp4_to_fp8_block(
+            layer.weight.data.unsqueeze(0), layer.weight_scale.data.unsqueeze(0)
+        )
+        replace_parameter(layer, "weight", w[0])
+        replace_parameter(layer, "weight_scale", s[0])
+        super().process_weights_after_loading(layer)

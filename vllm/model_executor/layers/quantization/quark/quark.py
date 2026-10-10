@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E
     QuarkMoEMethod,
 )
 from vllm.model_executor.layers.quantization.quark.schemes import (
+    QuarkMxfp4AsFp8PerBlock,
     QuarkNVFP4,
     QuarkOCP_MX,
     QuarkScheme,
@@ -913,6 +914,10 @@ class QuarkConfig(QuantizationConfig):
                 QuarkW4A8_MXFP4_FP8,
             )
         elif match := self._is_w_ocp_mx_a_x(weight_config, input_config):
+            if QuarkMxfp4AsFp8PerBlock.applies(
+                match.weight_quant_key, match.activation_quant_key
+            ):
+                return kFp8Static128BlockSym, kFp8Dynamic128Sym, QuarkMxfp4AsFp8PerBlock
             return match.weight_quant_key, match.activation_quant_key, QuarkOCP_MX
 
         raise NotImplementedError(
@@ -940,6 +945,7 @@ class QuarkConfig(QuantizationConfig):
         if scheme_cls not in (
             QuarkW8A8Fp8,
             QuarkW8A8Fp8PerBlock,
+            QuarkMxfp4AsFp8PerBlock,
             QuarkW8A8Int8,
             QuarkOCP_MX,
             QuarkNVFP4,
@@ -953,6 +959,7 @@ class QuarkConfig(QuantizationConfig):
         if scheme_cls in (
             QuarkW8A8Fp8,
             QuarkW8A8Fp8PerBlock,
+            QuarkMxfp4AsFp8PerBlock,
             QuarkW8A8Int8,
             QuarkOCP_MX,
         ):
